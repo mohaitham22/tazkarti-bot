@@ -104,7 +104,9 @@ PAGE_SCRIPT = """
         return (first + ' vs ' + second).trim();
     }).filter(m => m !== 'vs');
 
-    const isAlAhly = (t) => /al\\s*ahly/i.test(t) || norm(t).includes('\\u0627\\u0644\\u0627\\u0647\\u0644\\u064A');
+    // TEMP TEST SCAFFOLD -- widened to a team currently listed so the NEW/added
+    // branch of describe_change() can be exercised in CI. REVERT AFTER THE TEST.
+    const isAlAhly = (t) => /al\\s*ahly/i.test(t) || /pyramids/i.test(t) || norm(t).includes('\\u0627\\u0644\\u0627\\u0647\\u0644\\u064A');
 
     return { total: all.length, alAhly: all.filter(isAlAhly) };
 }
