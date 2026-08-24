@@ -96,7 +96,7 @@ PAGE_SCRIPT = """
         .replace(/\\u0649/g, '\\u064A')                          // ى -> ي
         .replace(/[\\u064B-\\u0652]/g, '');                      // diacritics
 
-    const cards = Array.from(document.querySelectorAll('.team-names-nonexistent'));
+    const cards = Array.from(document.querySelectorAll('.team-names'));
 
     const all = cards.map(el => {
         const first  = el.querySelector('.team-name.first')?.innerText.trim()  || '';
@@ -128,7 +128,7 @@ def fetch_al_ahly_matches(page) -> list:
     page.goto(TZK_URL, wait_until="domcontentloaded", timeout=45000)
 
     try:
-        page.wait_for_selector(".team-names-nonexistent", timeout=25000)
+        page.wait_for_selector(".team-names", timeout=25000)
     except PlaywrightTimeout:
         dump_evidence(page, "no-selector")
         raise ScrapeError(
