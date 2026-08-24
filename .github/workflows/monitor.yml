@@ -1,0 +1,38 @@
+name: Al Ahly Tazkarti Monitor
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes -- GitHub may run it a few minutes late when busy
+  workflow_dispatch:          # adds a manual "Run workflow" button in the Actions tab, for testing
+
+permissions:
+  contents: write   # needed so this workflow can commit last_seen.json back to the repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install requests playwright
+          playwright install --with-deps chromium
+
+      - name: Run check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python alahly_ticket_check.py
+
+      - name: Save updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_seen.json
+          git diff --staged --quiet || git commit -m "update last_seen state"
+          git push
