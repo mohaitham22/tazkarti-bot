@@ -53,8 +53,10 @@ from playwright.sync_api import sync_playwright
 load_dotenv()  # reads .env in this folder, if present
 
 TZK_URL = os.environ["TZK_URL"]
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+# An EMPTY value must fail exactly like a missing one -- an empty token
+# produces a 404 from Telegram that is easy to mistake for a network blip.
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 POLL_SECONDS = 30   # be reasonable -- this is someone else's server
 STATE_FILE = "last_seen.json"
@@ -103,21 +105,31 @@ def save_last_hash(h: str):
         json.dump({"hash": h}, f)
 
 
-def send_telegram(message: str):
+def send_telegram(message: str) -> bool:
+    """Returns True ONLY if Telegram accepted the message."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=10)
         if resp.status_code == 200:
             print("Telegram alert sent OK.")
+            return True
         else:
             # This is the important part -- Telegram tells you exactly
             # what's wrong (bad token, bad chat id, bot never started, etc).
             print("Telegram alert FAILED:", resp.status_code, resp.text)
+            return False
     except Exception as e:
         print("Telegram request errored:", e)
+        return False
 
 
 def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        raise SystemExit(
+            "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are empty or unset -- "
+            "check your .env file."
+        )
+
     print("Watching for Al Ahly ticket changes... (Ctrl+C to stop)")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -129,15 +141,23 @@ def main():
                 current_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 last_hash = load_last_hash()
 
+                delivered = True
                 if last_hash is not None and current_hash != last_hash:
                     print("Change detected \u2014 sending Telegram alert...")
                     detail = content if content else "(listing changed)"
-                    send_telegram(
+                    delivered = send_telegram(
                         "\U0001F534 Al Ahly listing changed on Tazkarti:\n"
                         f"{detail}\n\n{TZK_URL}"
                     )
 
-                save_last_hash(current_hash)
+                # Only advance the baseline once the alert is actually out.
+                # Saving after a failed send makes the next poll report no
+                # change, and the alert is lost for good.
+                if delivered:
+                    save_last_hash(current_hash)
+                else:
+                    print("Alert undelivered -- baseline kept so the next "
+                          "poll retries.")
 
             except Exception as e:
                 print("Check failed (will retry):", e)

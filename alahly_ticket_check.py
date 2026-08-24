@@ -32,8 +32,13 @@ import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 TZK_URL = os.environ.get("TZK_URL", "https://www.tazkarti.com/#/matches")
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+# .get().strip() rather than os.environ[...] on purpose: a MISSING secret
+# and an EMPTY one have to fail the same way. GitHub expands an undefined
+# secret reference to the empty string, which sails straight past
+# os.environ[...] and only resurfaces later as a baffling 404 from
+# api.telegram.org/bot/sendMessage -- while the job still reports success.
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 STATE_FILE = "last_seen.json"
 DEBUG_DIR = "debug"
@@ -150,7 +155,13 @@ def fetch_al_ahly_matches(page) -> list:
 # telegram
 # --------------------------------------------------------------------
 
-def send_telegram(message: str) -> None:
+def send_telegram(message: str) -> bool:
+    """Send an alert. Returns True ONLY if Telegram accepted it.
+
+    The return value is not decorative. An alert that was never delivered
+    must never be treated as delivered -- that is precisely the failure
+    mode this project exists to avoid.
+    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(
@@ -158,10 +169,14 @@ def send_telegram(message: str) -> None:
         )
         if resp.status_code == 200:
             print("Telegram alert sent OK.")
-        else:
-            print("Telegram alert FAILED:", resp.status_code, resp.text)
+            return True
+        # Telegram says exactly what is wrong: 404 = bad or empty token,
+        # 400 "chat not found" = bad chat id, or the bot was never started.
+        print("Telegram alert FAILED:", resp.status_code, resp.text)
+        return False
     except Exception as e:
         print("Telegram request errored:", e)
+        return False
 
 
 def describe_change(old: list, new: list) -> str:
@@ -182,6 +197,17 @@ def describe_change(old: list, new: list) -> str:
 # --------------------------------------------------------------------
 
 def main() -> int:
+    if not BOT_TOKEN or not CHAT_ID:
+        for line in (
+            "FATAL: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are empty or unset.",
+            "  In CI these come from repository Actions secrets:",
+            "  Settings > Secrets and variables > Actions > Repository secrets.",
+            "  An undefined secret expands to an empty string, which turns every",
+            "  alert into a 404 while the job still reports success.",
+        ):
+            print(line, file=sys.stderr)
+        return 2
+
     state = load_state()
 
     with sync_playwright() as p:
@@ -204,11 +230,13 @@ def main() -> int:
 
             print("SCRAPE FAILED:", e)
             if fails == 1 or fails % FAILURE_REALERT_EVERY == 0:
-                send_telegram(
+                delivered = send_telegram(
                     f"\u26A0\uFE0F Tazkarti monitor is not working "
                     f"(failure #{fails}).\n\n{e}\n\nNo ticket alerts will "
                     f"arrive until this is fixed.\n{TZK_URL}"
                 )
+                if not delivered:
+                    print("The failure warning could not be delivered either.")
             return 1
         finally:
             if browser.is_connected():
@@ -224,11 +252,19 @@ def main() -> int:
     if last_hash is None:
         print(f"Baseline established ({len(matches)} Al Ahly fixtures).")
     elif current_hash != last_hash:
-        send_telegram(
+        delivered = send_telegram(
             "\U0001F534 Al Ahly listing changed on Tazkarti:\n\n"
             f"{describe_change(last_matches, matches)}\n\n{TZK_URL}"
         )
-        print("Change detected -- alert sent.")
+        if not delivered:
+            # Deliberately do NOT advance the baseline. If the new hash were
+            # saved here, the next run would compare against it, print
+            # "No change.", and this change would be lost forever with nobody
+            # ever told. Leaving the baseline stale makes the next run retry.
+            print("Change detected but the alert was NOT delivered. "
+                  "Baseline left untouched so the next run retries.")
+            return 1
+        print("Change detected -- alert delivered.")
     else:
         print("No change.")
 
