@@ -2,37 +2,75 @@ name: Al Ahly Tazkarti Monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes -- GitHub may run it a few minutes late when busy
-  workflow_dispatch:          # adds a manual "Run workflow" button in the Actions tab, for testing
+    - cron: "*/10 * * * *"   # every 10 minutes -- GitHub often runs it late when busy
+  workflow_dispatch:          # manual "Run workflow" button, for testing
 
 permissions:
-  contents: write   # needed so this workflow can commit last_seen.json back to the repo
+  contents: write   # needed to commit last_seen.json back to the repo
+
+# Stops two runs from racing on the git push if one is slow.
+concurrency:
+  group: tazkarti-monitor
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # v5 / v6 run on Node 24 -- silences the Node 20 deprecation warning
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      # Chromium is ~150MB and was eating 28s of a 40s run. Cache it.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
 
       - name: Install dependencies
         run: |
           pip install requests playwright
-          playwright install --with-deps chromium
+          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" = "true" ]; then
+            playwright install-deps chromium
+          else
+            playwright install --with-deps chromium
+          fi
 
       - name: Run check
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TZK_URL: "https://www.tazkarti.com/#/matches"
         run: python alahly_ticket_check.py
 
+      # The whole point: when the scrape fails, this is how you SEE why.
+      # Download it from the run summary page -- screenshot + full HTML
+      # of what the runner actually received.
+      - name: Upload debug evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_number }}
+          path: debug/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Runs even on failure, so the failure counter persists.
       - name: Save updated state
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add last_seen.json
-          git diff --staged --quiet || git commit -m "update last_seen state"
-          git push
+          if ! git diff --staged --quiet; then
+            git commit -m "update last_seen state [skip ci]"
+            git pull --rebase --autostash
+            git push
+          else
+            echo "State unchanged, nothing to commit."
+          fi
