@@ -5,3 +5,6 @@
 .qodo/
 __pycache__/
 *.pyc
+
+# Runtime debug evidence (screenshots + HTML dumps) -- never commit
+debug/
