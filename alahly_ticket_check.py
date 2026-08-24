@@ -96,7 +96,7 @@ PAGE_SCRIPT = """
         .replace(/\\u0649/g, '\\u064A')                          // ى -> ي
         .replace(/[\\u064B-\\u0652]/g, '');                      // diacritics
 
-    const cards = Array.from(document.querySelectorAll('.team-names'));
+    const cards = Array.from(document.querySelectorAll('.team-names-nonexistent'));
 
     const all = cards.map(el => {
         const first  = el.querySelector('.team-name.first')?.innerText.trim()  || '';
@@ -104,9 +104,7 @@ PAGE_SCRIPT = """
         return (first + ' vs ' + second).trim();
     }).filter(m => m !== 'vs');
 
-    // TEMP TEST SCAFFOLD -- widened to a team currently listed so the NEW/added
-    // branch of describe_change() can be exercised in CI. REVERT AFTER THE TEST.
-    const isAlAhly = (t) => /al\\s*ahly/i.test(t) || /pyramids/i.test(t) || norm(t).includes('\\u0627\\u0644\\u0627\\u0647\\u0644\\u064A');
+    const isAlAhly = (t) => /al\\s*ahly/i.test(t) || norm(t).includes('\\u0627\\u0644\\u0627\\u0647\\u0644\\u064A');
 
     return { total: all.length, alAhly: all.filter(isAlAhly) };
 }
@@ -130,7 +128,7 @@ def fetch_al_ahly_matches(page) -> list:
     page.goto(TZK_URL, wait_until="domcontentloaded", timeout=45000)
 
     try:
-        page.wait_for_selector(".team-names", timeout=25000)
+        page.wait_for_selector(".team-names-nonexistent", timeout=25000)
     except PlaywrightTimeout:
         dump_evidence(page, "no-selector")
         raise ScrapeError(
