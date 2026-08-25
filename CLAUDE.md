@@ -9,11 +9,10 @@ where a human must take over.
 Stack: Python 3.12 + Playwright (Chromium) + Telegram Bot API + GitHub Actions (cron).
 No server, no database, no web UI. State is a single JSON file committed back to the repo.
 
-**Phase 0 and Phase 1 are DONE. The Actions migration is verified end to end — scrape,
-change alert, failure alert, debug artifact, baseline preservation, recovery, and scheduled
-cron all proven against real runs. Phase 2 is now the priority and is no longer optional: the
-scraper reads only the FIRST PAGE of the listing and is missing a live Al Ahly fixture right
-now. See Known Bug below before doing anything else.**
+**Phase 0 and Phase 1 are DONE and the pagination bug is FIXED. The monitor now reads the
+entire listing, currently tracks `ZED FC vs Al Ahly FC`, and has delivered a real alert for it
+(run #44, 2026-08-25). There is no blocking bug. Phase 2 — changing the signal from "the
+fixture list changed" to "tickets are buyable" — is the next work.**
 
 Repo: `mohaitham22/tazkarti-bot` — **PUBLIC**. Every rule about secrets in this file follows
 from that one fact.
@@ -31,62 +30,50 @@ Phase 2  ⬜ NOT STARTED  Change the signal from "fixture list changed" to "tick
 Phase 3  ⬜ NOT STARTED  Pre-fill helper: replace TODO selectors with Tazkarti's real ones.
 ```
 
-**Phase 1 is proven, so Phase 2 is unblocked — but fix the pagination bug FIRST. A scraper
-that reads 6 of 10 matches cannot be taught to detect a better signal either; it would just
-detect it on the wrong 6.**
+**Phase 1 is proven and the scraper now reads the whole listing, so Phase 2 is unblocked for
+real. The `.status` selector it needs is already recorded in Feature Specs below.**
 **Do NOT start Phase 3 until Phase 2 gives a usable per-match URL to open.**
 **Phase 3 is LOCAL ONLY and never runs in CI. See Coding Rules.**
 
 ---
 
-## ⚠️ Known Bug — Fix This Before Any New Feature
+## ✅ No Blocking Bug — Pagination Fixed 2026-08-25
 
-**The scraper reads only the first page of the listing, and is missing a live Al Ahly fixture
-right now.**
+Kept as a record, because it is the best example in this project of a green job proving nothing.
 
-`#/matches` renders 6 match cards plus a `View More` button. The monitor waits for
-`.team-names`, parses what is in the DOM, and never clicks anything. Everything past the first
-6 is invisible to it.
+**What was wrong.** `#/matches` renders 6 match cards and hides the rest behind a `View More`
+button. Neither script ever clicked it, so both read page 1 and stopped. `ZED FC vs Al Ahly FC`
+— the exact fixture this project exists to watch — sat on page 2 while every run truthfully
+reported `Parsed 6 match cards, 0 of them Al Ahly.` and stayed silent.
 
-Measured 2026-08-24 from Cairo, headless, same selectors as the monitor:
+**It survived the entire Phase 1 test suite.** All four acceptance criteria passed. None of
+them asked whether the scrape saw every match. A fifth criterion has been added below so the
+same shape of gap cannot pass again.
+
+**The fix (`8178263`).** `load_all_pages()` clicks `View More` until it disappears or reports
+disabled, then parses. Bounded at `LOAD_MORE_MAX_CLICKS = 20`; if the button is still live when
+that budget runs out it raises rather than returning, because a partial listing reported as a
+complete one is the original bug wearing a different hat. It also stops early if a click adds
+no cards, so a button that never disables cannot spin forever.
+
+The control is selected by class, not by text, so it survives the site being served in Arabic:
 
 ```
-page 1 (all the monitor ever sees):   6 matches
-after one click of "View More":      10 matches
-"View More" then goes disabled   ->  10 is the entire list
+button.button-blue.width-auto:not(.filter-toggle)
 ```
 
-The four it has never scraped:
+`:not(.filter-toggle)` is load-bearing — the two Search buttons also carry `button-blue` and
+`width-auto`, and clicking one of those re-filters the listing instead of extending it.
 
-```
-El Sharkia Enppi vs Wadi Degla
-Canal SC vs El Gouna FC
-Alithad Alexandria vs Ceramica Cleopatra FC
-ZED FC vs Al Ahly FC          <-- the fixture this whole project exists to watch
-```
+**Result, run #44:** `Parsed 10 match cards after 1 'View More' click(s), 1 of them Al Ahly.` /
+`Telegram alert sent OK.` The one-time NEW alert fired as predicted and the baseline moved from
+the empty-string hash to `8fbc6677...1e89` with `matches: ["ZED FC vs Al Ahly FC"]`.
 
-Every run to date has honestly reported `Parsed 6 match cards, 0 of them Al Ahly.` and stayed
-quiet while `ZED FC vs Al Ahly FC` sat on page 2. `last_seen.json` holding the empty-string
-hash is no longer a poisoned baseline — it is a faithful record of an incomplete scrape, which
-is arguably worse, because it looks correct.
-
-**This survived the entire Phase 1 test suite.** All four acceptance criteria pass. Not one of
-them asked "does it see every match?" The Phase 1 lesson generalises further than it first
-appeared: a green job proves only what the test actually checked.
-
-**It affects both runtimes equally.** `alahly_ticket_monitor.py` has no click handling either,
-so it has the identical defect. Phase 0's "confirmed working" only ever meant "detects changes
-among the first 6 fixtures." Until this is fixed in both, the local script is NOT a trustworthy
-reference implementation.
-
-**Fix direction — designed, deliberately not implemented, awaiting a decision:** click
-`View More` until it vanishes or reports disabled, then parse. Bounded click count, a short
-wait between clicks, identical code in both scripts per rule 13. Open questions worth settling
-before writing it: how many clicks to allow before calling it a failure, and whether to read
-the `.status` badge in the same pass, which would collapse Phase 2 into this change.
-
-**Expect one loud alert when it is fixed.** The first corrected run will diff `[]` against
-`["ZED FC vs Al Ahly FC"]` and fire a real NEW alert. That is correct behaviour, not a bug.
+**Landed in both scripts (rule 13).** `PAGE_SCRIPT` and the whole pagination block are now
+byte-identical between them, copied programmatically rather than by hand. That also pulled
+`alahly_ticket_monitor.py` up to the CI script's behaviour — `wait_for_selector` instead of
+`networkidle` plus a fixed sleep, Arabic normalisation, and sorted output. It had none of the
+three, so it could not previously have served as a reference for any of them.
 
 ---
 
@@ -96,12 +83,12 @@ the `.status` badge in the same pass, which would collapse Phase 2 into this cha
 
 | File | Status | Notes |
 |---|---|---|
-| `alahly_ticket_check.py` | ✅ Verified in CI | Parses cards, detects change, alerts, fails loudly, preserves the baseline on failure, recovers. All four acceptance criteria proven against it. **Reads page 1 only — see Known Bug.** |
-| `alahly_ticket_monitor.py` | ⚠️ Same page-1 bug | Local loop, `POLL_SECONDS = 30`. Notification fix mirrored in. Not a trustworthy reference until pagination is fixed in both. |
+| `alahly_ticket_check.py` | ✅ Verified in CI | Parses the FULL listing, detects change, alerts, fails loudly, preserves the baseline on failure, recovers. All five acceptance criteria proven against it. |
+| `alahly_ticket_monitor.py` | ✅ Trustworthy reference | Local loop, `POLL_SECONDS = 30`. Scraping logic now byte-identical to the CI script. Verified locally: same 10 cards, same 1 Al Ahly fixture. |
 | `alahly_ticket_prefill.py` | ⬜ Skeleton | Every selector a `TODO`. Never run for real. |
 | `get_telegram_chat_id.py` | ✅ Working | One-shot helper, purpose served. |
 | `.github/workflows/monitor.yml` | ✅ Working | `cron: */10`, `contents: write`, `checkout@v5` / `setup-python@v6`, Playwright cache, artifact upload on failure, concurrency group. Node 20 warning gone. |
-| `last_seen.json` | ⚠️ Incomplete, not wrong | `{hash: e3b0c442...b855, matches: []}`. Accurately records a page-1-only scrape. |
+| `last_seen.json` | ✅ Complete | `{hash: 8fbc6677...1e89, matches: ["ZED FC vs Al Ahly FC"]}`. First baseline in this project's history that reflects the whole listing. |
 | `env.example` | ✅ Exists | Docstrings say `.env.example`; the repo file is `env.example`. Harmless. |
 
 ### Verified working — with run numbers, 2026-08-24
@@ -122,14 +109,15 @@ the `.status` badge in the same pass, which would collapse Phase 2 into this cha
 
 ### Not yet verified
 
-- Whether an Al Ahly fixture is ever actually detected — the scraper has never read the page
-  one would appear on. This is the Known Bug.
-- Phase 2 availability signal. Selectors are now known but unused (see Feature Specs).
+- Phase 2 availability signal. Selectors are known but unused (see Feature Specs). Only
+  `.status.green` / `Available` has ever been observed — the sold-out and coming-soon variants
+  are still unseen, so their exact markup is guesswork until one appears.
 - Prefill helper, in any form.
+- Whether an Al Ahly fixture being *added* to the listing fires correctly. Run #44 proved the
+  added-branch works, but via the pagination fix rather than a genuine new fixture.
 
 ### Standing Blockers
 
-- **Page-1-only scrape** — the live blocker, in BOTH scripts. See Known Bug.
 - **Signal is fixture-list, not availability** — `.team-names` changes when a fixture is added
   or removed; tickets opening for an already-listed match does not touch it. Phase 2. The
   selector is now known: `.status` (see Feature Specs).
@@ -159,8 +147,9 @@ the `.status` badge in the same pass, which would collapse Phase 2 into this cha
 1. Read this entire CLAUDE.md top to bottom.
 2. Read the Known Bug section — if it is still present, that is the work.
 3. Find the last row in the Session Log — that is where we left off.
-4. Check the current contents of `last_seen.json` in the repo. Compare against
-   `e3b0c442...b855` (empty-string hash). If it still matches, the scraper is still broken.
+4. Check `last_seen.json`. `matches` should be non-empty. If `hash` is `e3b0c442...b855`
+   — the SHA-256 of the empty string — the scrape is returning nothing; treat that as broken
+   until the run log's card count proves otherwise.
 5. Confirm out loud: "I've read the context. We are in Phase X. Last session did Y. Continuing with Z."
 6. Only then start writing code.
 
@@ -182,6 +171,7 @@ lesson of Phase 1.**
 |---|---|---|---|---|
 | 2026-08-24 | 0 → 1 | Local monitor confirmed working. Actions workflow written, secrets *believed* added, first manual run green. | Scrape returns empty on runner. Telegram untested in CI. | Commit rewritten check script, run manually, read the debug artifact. |
 | 2026-08-24 | 1 → ✅ | Verified all three failure paths in CI (runs #10/#11/#12). Found + fixed a silent Telegram delivery failure. Rotated leaked credentials. Found the page-1 pagination bug. | Scraper reads 6 of 10 matches and is missing live `ZED FC vs Al Ahly FC`. | Decide the `View More` fix, then apply it to BOTH scripts in one commit. |
+| 2026-08-25 | 1 → 2 | Fixed pagination in both scripts (`8178263`); scraper reads all 10 fixtures and now tracks `ZED FC vs Al Ahly FC`. Real alert delivered, run #44. Aligned the local monitor with the CI script. Fixed a truncated `TZK_URL` in `.env`. | None blocking. | Phase 2: read `.status` per match, alert on availability rather than on fixture-list changes. |
 
 ### Session Notes (Full Detail)
 
@@ -288,6 +278,54 @@ Bug.
 *Phase 2 selectors recorded.* Read out of the `debug-11` HTML rather than guessed, as this
 file demands. `.status` is the availability badge; observed only as
 `<div class="status green"> Available </div>`. See Feature Specs.
+
+**Session 2026-08-25 — pagination fixed, Phase 1 closed for real**
+
+*The fix (`8178263`).* `load_all_pages()` in both scripts clicks `View More` until it is gone
+or reports disabled, then parses. Three deliberate choices:
+
+- **Selected by class, not text.** `button.button-blue.width-auto:not(.filter-toggle)`. The
+  browser context sets `locale="ar-EG"`, so a text match on "View More" would break the day
+  Tazkarti serves Arabic. `:not(.filter-toggle)` is load-bearing: the page has three
+  `button-blue` elements and two of them are Search buttons carrying `width-auto` as well.
+  Clicking one of those would re-filter the listing rather than extend it. Verified the
+  selector resolves to exactly one element on the live page.
+- **Bounded at 20 clicks, and the budget running out is an ERROR, not a silent return.** If the
+  button is still enabled after 20 clicks we cannot prove we saw the whole list, and a partial
+  listing reported as complete is the original bug in a new costume.
+- **Stops early if a click adds no cards**, so a button that never disables cannot spin.
+
+*Verified before pushing.* Locally, against the live site: `Parsed 10 match cards after 1
+'View More' click(s), 1 of them Al Ahly.` -> `['ZED FC vs Al Ahly FC']`. The guard was tested
+by forcing `LOAD_MORE_MAX_CLICKS = 0` in-process, which correctly raised instead of returning
+a 6-fixture list. Then in CI, run #44: same line, `Telegram alert sent OK.`,
+`Change detected -- alert delivered.` The stored hash `8fbc6677...1e89` matches the value
+computed locally before the push.
+
+*Rule 13, enforced rather than promised.* `PAGE_SCRIPT` and the entire pagination block were
+copied programmatically from `alahly_ticket_check.py` into `alahly_ticket_monitor.py`, then
+both were re-extracted and SHA-compared to confirm byte-identity. Doing it by hand is how they
+drifted in the first place.
+
+*What that alignment exposed.* The local monitor was NOT a reference implementation in any
+meaningful sense. It used `networkidle` plus a fixed 2s sleep (rule 7 says never), had no
+Arabic normalisation (rule 6), and hashed in DOM order without sorting (rule 5). All three are
+now fixed by sharing the CI script's code.
+
+*`.env` had a truncated `TZK_URL`.* It read `"https://www.tazkarti.com"` — the homepage, with
+no `#/matches` route — so `alahly_ticket_monitor.py`, which is the only script that calls
+`load_dotenv()`, was loading a page that has no `.team-names` at all. `env.example` and
+`monitor.yml` both carry the correct value; only `.env` was wrong, and the copy committed in
+`b8ccce9` has the same truncated value, so it has been wrong since the initial commit.
+**This casts real doubt on the Phase 0 claim that the local monitor was "confirmed working
+with real Telegram alerts."** With that URL it would scrape nothing every time, hash the empty
+string, and never alert. Fixed locally; `.env` is gitignored so there is nothing to commit.
+Worth remembering that the CI script survived only because `monitor.yml` sets `TZK_URL`
+explicitly and the script's own default is correct.
+
+*Not done, deliberately.* Phase 2 was not folded into this change. The scrape still returns a
+list of fixture strings, so adding a per-match `status` stays additive, exactly as the v2 notes
+ask.
 
 ---
 
@@ -605,9 +643,12 @@ rm last_seen.json
       exit 1 plus `debug-11` (210 KB, PNG + HTML), baseline preserved
 - [x] A scheduled (not manual) run appears in the Actions tab — runs #2, #3, #5, #6, #9
 
-**All four pass — and note what they did NOT check: that the scrape sees every match on the
-page. It does not (Known Bug). Before declaring any future phase done, add the criterion that
-would have caught it: compare the scraped count against the full list behind `View More`.**
+- [x] The scrape sees every match on the page, not just the first — run #44,
+      `Parsed 10 match cards after 1 'View More' click(s)`, matching a local click-through
+
+**The fifth criterion exists because the first four all passed while the scraper was reading 6
+of 10 fixtures and missing the only Al Ahly match on the site. When adding a phase, ask what a
+passing suite would still fail to notice, and write that down as a criterion.**
 
 ---
 
