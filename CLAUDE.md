@@ -160,6 +160,13 @@ three, so it could not previously have served as a reference for any of them.
 
 ### Not yet verified
 
+- ~~**The whole alert chain, end to end.**~~ **RE-PROVEN 2026-08-26**, on the live site, from
+  the always-on runner: `Change detected -- sending Telegram alert...` / `Telegram alert sent
+  OK.` at 00:14:03, scrape to delivery inside one second, and the baseline self-healed to the
+  true hash on the same poll. **That test also found a documentation bug:** the procedure this
+  file used to give (change `status`, NOT the hash) fires NOTHING, because detection compares
+  the stored `hash` field and `matches` only supplies the alert wording. Corrected in How to
+  Run -- change BOTH.
 - ~~**A Phase 2 alert actually arriving in Telegram.**~~ **RESOLVED 2026-08-25.** Delivered
   from the local runner: `Change detected -- sending Telegram alert...` / `Telegram alert sent
   OK.` at 22:25:37, by doctoring the tracked fixture's `status` to `4` in
@@ -1436,12 +1443,31 @@ python alahly_ticket_check.py
 rm last_seen.json
 
 # Force an alert, to test the Telegram path end-to-end.
-# Since Phase 2 the hash covers matchStatus, so change the STATUS, not the
-# hash -- that way the alert text exercises a real transition:
-#   in last_seen.json, set the tracked fixture's "status" to 4, then run.
-#   Expect: "TICKETS ON SALE: ZED FC vs Al Ahly FC (COMING_SOON -> AVAILABLE)"
-# Changing a character of the hash still fires, but produces the
-# no-transition-identified wording instead, which tests less.
+#
+# CHANGE BOTH THE HASH AND THE STATUS. An earlier version of this file said
+# to change the status and NOT the hash; that is WRONG and fires nothing.
+# Proven empirically 2026-08-26: two polls read the doctored status and both
+# printed "No change." Detection compares the freshly computed hash against
+# the STORED `hash` FIELD --
+#       elif current_hash != last_hash:
+# -- and `matches` is only read afterwards, by describe_change(), to word
+# the alert. So the two fields do different jobs:
+#
+#   hash    -> the TRIGGER.  Change it or nothing happens at all.
+#   status  -> the WORDING.  Change it so the text exercises a transition.
+#
+# Do both, e.g. in last_seen_local.json (the LOCAL runner's state file):
+#   "hash":   "a086020c..."  ->  "deadbeef..."      (keep the same length)
+#   "status": 1              ->  4                   (+ label COMING_SOON)
+# Expect: "TICKETS ON SALE: ZED FC vs Al Ahly FC (COMING_SOON -> AVAILABLE)"
+#
+# Change ONLY the hash and it still fires, but with the
+# no-transition-identified wording, which tests less.
+#
+# Write the file as UTF-8 with NO BOM -- PowerShell's Set-Content adds one
+# and load_state() then treats the file as corrupt. Use Python, not
+# Set-Content. The runner self-heals on the next poll: it saves the real
+# hash and status again, so this test leaves nothing behind.
 
 # ── THE ALWAYS-ON LOCAL RUNNER (Phase 4) ─────────────────────────
 # Install / re-install (idempotent -- re-run after editing the .ps1):
