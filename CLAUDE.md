@@ -9,10 +9,11 @@ where a human must take over.
 Stack: Python 3.12 + Playwright (Chromium) + Telegram Bot API + GitHub Actions (cron).
 No server, no database, no web UI. State is a single JSON file committed back to the repo.
 
-**Phase 0 and Phase 1 are DONE and the pagination bug is FIXED. The monitor now reads the
-entire listing, currently tracks `ZED FC vs Al Ahly FC`, and has delivered a real alert for it
-(run #44, 2026-08-25). There is no blocking bug. Phase 2 — changing the signal from "the
-fixture list changed" to "tickets are buyable" — is the next work.**
+**Phases 0, 1 and 2 are DONE. The monitor reads the entire listing and now alerts on
+`matchStatus` — "tickets are buyable" — rather than on the fixture list changing. It currently
+tracks `ZED FC vs Al Ahly FC` (matchStatus 1, AVAILABLE). There is no blocking bug. The one
+thing not yet proven is a Phase 2 alert actually arriving in Telegram; see Not Yet Verified.
+Phase 3 (the prefill helper) is the next work and is still gated — see its entry.**
 
 Repo: `mohaitham22/tazkarti-bot` — **PUBLIC**. Every rule about secrets in this file follows
 from that one fact.
@@ -26,13 +27,17 @@ Phase 0  ✅ DONE         Local monitor: Playwright scrape + hash diff + Telegra
                          Confirmed working — real alerts received on hash change.
 Phase 1  ✅ DONE         GitHub Actions migration so the monitor runs without a terminal open.
                          All four acceptance criteria proven. Runs #10/#11/#12, 2026-08-24.
-Phase 2  ⬜ NOT STARTED  Change the signal from "fixture list changed" to "tickets are buyable".
+Phase 2  ✅ DONE         Signal is now each fixture's raw matchStatus, not the fixture list.
+                         Verified against the live site 2026-08-25. Telegram delivery of a
+                         Phase 2 alert is the one thing still unproven.
 Phase 3  ⬜ NOT STARTED  Pre-fill helper: replace TODO selectors with Tazkarti's real ones.
 ```
 
-**Phase 1 is proven and the scraper now reads the whole listing, so Phase 2 is unblocked for
-real. The `.status` selector it needs is already recorded in Feature Specs below.**
-**Do NOT start Phase 3 until Phase 2 gives a usable per-match URL to open.**
+**Phase 2 landed the availability signal AND handed Phase 3 what it was waiting for: the feed
+carries a stable `matchId` per fixture (Al Ahly's current one is 2559), which is the per-match
+identifier Phase 3 needs. `TZK_MATCH_URL` can be derived from it instead of being pasted by
+hand — but the URL shape has NOT been confirmed yet, so confirm it against the live site before
+building on it.**
 **Phase 3 is LOCAL ONLY and never runs in CI. See Coding Rules.**
 
 ---
@@ -83,12 +88,13 @@ three, so it could not previously have served as a reference for any of them.
 
 | File | Status | Notes |
 |---|---|---|
-| `alahly_ticket_check.py` | ✅ Verified in CI | Parses the FULL listing, detects change, alerts, fails loudly, preserves the baseline on failure, recovers. All five acceptance criteria proven against it. |
-| `alahly_ticket_monitor.py` | ✅ Trustworthy reference | Local loop, `POLL_SECONDS = 30`. Scraping logic now byte-identical to the CI script. Verified locally: same 10 cards, same 1 Al Ahly fixture. |
+| `alahly_ticket_check.py` | ✅ Verified locally, CI run pending | Source of truth for the shared block. Parses the FULL listing, reads raw `matchStatus`, detects availability change, alerts, fails loudly, preserves the baseline on failure, recovers. |
+| `alahly_ticket_monitor.py` | ✅ Trustworthy reference | Local loop, `POLL_SECONDS = 30`. Shared block copied by `sync_shared_block.py` and SHA-verified identical. Four consecutive polls verified locally. |
+| `sync_shared_block.py` | ✅ New, working | Enforces rule 13 mechanically. `python sync_shared_block.py` copies the block from the check script into the monitor; `--check` verifies and exits 1 on drift. Run `--check` before committing. |
 | `alahly_ticket_prefill.py` | ⬜ Skeleton | Every selector a `TODO`. Never run for real. |
 | `get_telegram_chat_id.py` | ✅ Working | One-shot helper, purpose served. |
 | `.github/workflows/monitor.yml` | ✅ Working | `cron: */10`, `contents: write`, `checkout@v5` / `setup-python@v6`, Playwright cache, artifact upload on failure, concurrency group. Node 20 warning gone. |
-| `last_seen.json` | ✅ Complete | `{hash: 8fbc6677...1e89, matches: ["ZED FC vs Al Ahly FC"]}`. First baseline in this project's history that reflects the whole listing. |
+| `last_seen.json` | ✅ Migrated to v3 | `{hash: a086020c...66c5, matches: [{match_id: 2559, fixture: "ZED FC vs Al Ahly FC", status: 1, ...}]}`. `matches` is now a list of OBJECTS, not strings, and the hash covers `matchStatus`. Not comparable with any pre-2026-08-25 hash. |
 | `env.example` | ✅ Exists | Docstrings say `.env.example`; the repo file is `env.example`. Harmless. |
 
 ### Verified working — with run numbers, 2026-08-24
@@ -109,18 +115,33 @@ three, so it could not previously have served as a reference for any of them.
 
 ### Not yet verified
 
-- Phase 2 availability signal. Selectors are known but unused (see Feature Specs). Only
-  `.status.green` / `Available` has ever been observed — the sold-out and coming-soon variants
-  are still unseen, so their exact markup is guesswork until one appears.
+- **A Phase 2 alert actually arriving in Telegram.** `describe_change()` is unit-tested for
+  every transition and `send_telegram()` is unchanged and previously proven, but no Phase 2
+  message has been delivered end-to-end. Test it the documented way: edit `last_seen.json`,
+  change the tracked fixture's `status` from `1` to `4`, and run the script — it should send
+  `🎫 TICKETS ON SALE: ZED FC vs Al Ahly FC (COMING_SOON -> AVAILABLE)`.
+- **Phase 2 running in CI at all.** Everything so far is local. The first scheduled run after
+  this commit is the real test.
+- **matchStatus values 2, 3 and 4 in the wild.** Every fixture on the site has been `1` the
+  whole time. The vocabulary is not guesswork — it was read out of Tazkarti's own compiled
+  template and i18n files (see Feature Specs) — but no transition has ever been *observed*.
+  This is why the hash covers the raw integer: an unrecognised value still moves it.
 - Prefill helper, in any form.
-- Whether an Al Ahly fixture being *added* to the listing fires correctly. Run #44 proved the
-  added-branch works, but via the pagination fix rather than a genuine new fixture.
 
 ### Standing Blockers
 
-- **Signal is fixture-list, not availability** — `.team-names` changes when a fixture is added
-  or removed; tickets opening for an already-listed match does not touch it. Phase 2. The
-  selector is now known: `.status` (see Feature Specs).
+- ~~**Signal is fixture-list, not availability**~~ — RESOLVED 2026-08-25 by Phase 2. The hash
+  now covers each fixture's raw `matchStatus`.
+- **Team identity depends on a hardcoded id.** `AL_AHLY_TEAM_ID = 77`. If Tazkarti ever
+  reissues it, the id test stops matching — the name test is kept as a fallback precisely so
+  that failure is noisy rather than silent, but the fallback is also what makes `NBE Club`
+  match, so `DECOY_TEAM_IDS` has to stay accurate. If a fixture you don't care about starts
+  showing up in alerts, add its team id there.
+- **The availability signal depends on a second, undocumented source.** `matchStatus` comes
+  from `/data/matches-list-json.json`, which Tazkarti can rename or restructure independently
+  of the page's markup. The script refuses to fall back to the badge text when the feed is
+  missing (it raises), so this fails loudly — but it is a new dependency the DOM-only version
+  did not have.
 - **`.env` was committed to PUBLIC history.** Commit `b8ccce9` contains a real `.env` with
   `TZK_USERNAME`, `TZK_PASSWORD`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`. Removing it in
   `acbc288` did not remove it from history — the blob still returns HTTP 200 with no auth.
@@ -147,9 +168,12 @@ three, so it could not previously have served as a reference for any of them.
 1. Read this entire CLAUDE.md top to bottom.
 2. Read the Known Bug section — if it is still present, that is the work.
 3. Find the last row in the Session Log — that is where we left off.
-4. Check `last_seen.json`. `matches` should be non-empty. If `hash` is `e3b0c442...b855`
-   — the SHA-256 of the empty string — the scrape is returning nothing; treat that as broken
-   until the run log's card count proves otherwise.
+4. Check `last_seen.json`. `matches` should be non-empty and its entries should be OBJECTS
+   carrying an integer `status`. If they are plain strings, the state is pre-Phase-2 and the
+   next run will silently re-baseline. If `hash` is `e3b0c442...b855` — the SHA-256 of the
+   empty string — the scrape is returning nothing; treat that as broken until the run log's
+   card count proves otherwise.
+   Also run `python sync_shared_block.py --check`; if it reports drift, fix that first.
 5. Confirm out loud: "I've read the context. We are in Phase X. Last session did Y. Continuing with Z."
 6. Only then start writing code.
 
@@ -172,6 +196,7 @@ lesson of Phase 1.**
 | 2026-08-24 | 0 → 1 | Local monitor confirmed working. Actions workflow written, secrets *believed* added, first manual run green. | Scrape returns empty on runner. Telegram untested in CI. | Commit rewritten check script, run manually, read the debug artifact. |
 | 2026-08-24 | 1 → ✅ | Verified all three failure paths in CI (runs #10/#11/#12). Found + fixed a silent Telegram delivery failure. Rotated leaked credentials. Found the page-1 pagination bug. | Scraper reads 6 of 10 matches and is missing live `ZED FC vs Al Ahly FC`. | Decide the `View More` fix, then apply it to BOTH scripts in one commit. |
 | 2026-08-25 | 1 → 2 | Fixed pagination in both scripts (`8178263`); scraper reads all 10 fixtures and now tracks `ZED FC vs Al Ahly FC`. Real alert delivered, run #44. Aligned the local monitor with the CI script. Fixed a truncated `TZK_URL` in `.env`. | None blocking. | Phase 2: read `.status` per match, alert on availability rather than on fixture-list changes. |
+| 2026-08-25 | 2 → ✅ | Phase 2 built. Signal is now the raw `matchStatus` from the page's own JSON feed, not `.team-names`. Structured state (v3), transition-aware alert wording, DOM/feed cross-check. Fixed two bugs found by testing: `NBE Club` tracked as Al Ahly, and the SPA never reloading between polls. Added `sync_shared_block.py` to enforce rule 13 mechanically. | Phase 2 alert not yet delivered to Telegram; not yet run in CI. | Force one alert to prove delivery, watch the first scheduled CI run, then Phase 3. |
 
 ### Session Notes (Full Detail)
 
@@ -327,6 +352,70 @@ explicitly and the script's own default is correct.
 list of fixture strings, so adding a per-match `status` stays additive, exactly as the v2 notes
 ask.
 
+**Session 2026-08-25 (second) — Phase 2 built**
+
+*The instruction that shaped the design.* The first proposal was to read the `.status` badge,
+map its text to a canonical token (`AVAILABLE`, `COMING_SOON`, …) and hash the token. That was
+rejected for a good reason: **hash the raw value, not a token derived from it.** If Tazkarti
+adds a `matchStatus 5` and the mapping funnels unknowns into an existing token, the hash never
+moves and the monitor goes quiet on a state it did not recognise — the empty-hash bug wearing a
+different hat. This is now rule 15.
+
+*Which forced a better source.* `matchStatus` **is not in the DOM**. The badge only ever
+carries a colour class and a translated label, both derived from it. Chasing the raw value
+turned up that the listing page fetches its own data from the public static file
+`/data/matches-list-json.json`, and renders the cards from it. The script now captures the
+response the page already requested (`page.on("response")`, registered before `goto()`), so it
+makes no extra request — rule 12 intact. That payload also carries `matchId`, which is a
+better identity than the fixture string and is what Phase 3 needs.
+
+*Selectors were read, never guessed.* The full rendered page was dumped to
+`debug/phase2-full.html` and each `.match` card to `debug/phase2-cards.json`. The status
+vocabulary came out of the compiled Angular bundle `8.7c7ab3ab9f9641d7d4c4.js` plus
+`assets/i18n/{en,ar,fr}.json` — all four values, in three languages, in the Feature Specs
+table. The Book Ticket button was examined and rejected: its colour class is static, and its
+`disabled` depends on login state and a transient `startBooking` flag.
+
+*The noise the brief warned about was real.* Two of the twelve `.match` elements are hidden
+virtual-queue templates carrying `Last update time : 05 : 07 PM`. Sampled a minute apart it
+read `05 : 12` then `05 : 13`. Hashing card text wholesale would have alerted on every run.
+They are excluded by skipping cards with blank team names.
+
+*Bug found by testing, #1 — `NBE Club` tracked as an Al Ahly fixture.* Reading the JSON meant
+reading Arabic team names for the first time, and `NBE Club` is `نادى البنك الاهلى المصرى` —
+the National Bank of Egypt. `الاهلى` is just the Arabic for "national", so it matches any
+reasonable "al ahly" pattern. A test asserting the fixture count caught it returning 2 where
+there should be 1; reading the code would not have. Fixed by matching `teamId 77` first, with
+the name test kept only as a fallback so a reissued id is noisy rather than silent, and
+`DECOY_TEAM_IDS = {171: NBE}` to stop the fallback firing. Now rule 16.
+
+*Bug found by testing, #2 — the local monitor never actually reloaded.* Running the loop for
+more than one poll produced `The page never fetched 'matches-list-json'` on polls 2+.
+`TZK_URL` is a hash route, so `page.goto()` to the identical URL is a **same-document
+navigation**: no page load, Angular never re-bootstraps, the feed is never re-fetched. The
+monitor reuses one page across polls, **so every poll after the first was re-reading the DOM
+left over from the first one.** This is pre-existing and predates Phase 2 — the old monitor
+would have printed `No change.` forever no matter what happened on the site. Together with
+last session's truncated `TZK_URL`, the Phase 0 claim that the local monitor was "confirmed
+working with real Telegram alerts" should be treated as unproven. Fixed with a
+`page.goto("about:blank")` before each real navigation; verified across four consecutive polls.
+
+*Rule 13, now mechanical.* `sync_shared_block.py` copies everything between the
+`SHARED SCRAPE BLOCK` markers from `alahly_ticket_check.py` into `alahly_ticket_monitor.py`,
+re-extracts it, and SHA-compares. `--check` exits 1 on drift. The block is currently 501 lines,
+`sha256 155cbaf83039...`. The previous session did this by hand-driven script; this makes it a
+committed, repeatable step.
+
+*State migrated in place.* `last_seen.json` went from the v2 string list to v3 objects. The old
+hash covered fixture names only and is not comparable, so the migration re-establishes the
+baseline **quietly** rather than firing an alert about a format change. Verified: first run
+printed the migration notice and no alert, second run printed `No change.`
+
+*What is NOT proven.* No Phase 2 alert has been delivered to Telegram, and none of this has run
+in CI yet. `send_telegram()` is unchanged and previously proven, and `describe_change()` is
+unit-tested for every transition, but neither fact is delivery. Force one alert before trusting
+this: set the tracked fixture's `status` to `4` in `last_seen.json` and run the script.
+
 ---
 
 ## What We Are Building
@@ -379,7 +468,7 @@ line exists to stop.
 | State | `last_seen.json` on disk | `last_seen.json` committed to the repo |
 | Secrets | `.env` via `python-dotenv` | Repo Actions secrets |
 | Requires terminal open | Yes | No |
-| Status | ✅ Known-good reference | ⚠️ Under repair |
+| Status | ✅ Reference implementation | ✅ Working; source of truth for the shared block |
 
 **Why both exist:** the local version is the ground truth. When the CI version misbehaves, run
 the local one to determine whether the problem is the code or the environment. Do not delete it.
@@ -393,14 +482,20 @@ having a reference implementation.
 ```
 GitHub Actions cron (*/10)
   └─> checkout repo (brings last_seen.json)
-      └─> headless Chromium -> tazkarti.com/#/matches
-          └─> wait for .team-names to render
+      └─> headless Chromium -> about:blank -> tazkarti.com/#/matches
+          │   (capturing the page's own /data/matches-list-json.json response)
+          └─> wait for .team-names, then for .status
               ├─ timeout / 0 cards  -> save screenshot+HTML -> Telegram warning -> exit 1
-              └─ N cards parsed
-                  └─> filter Al Ahly -> sort -> join -> sha256
-                      ├─ hash == baseline      -> "No change." -> exit 0
-                      ├─ no baseline yet       -> establish it, stay quiet
-                      └─ hash != baseline      -> Telegram diff -> exit 0
+              └─> click "View More" until exhausted
+                  └─> DOM card count MUST equal feed row count, else exit 1
+                      └─> keep rows where teamId 77 plays -> {match_id, fixture,
+                          │                                   raw matchStatus}
+                          └─> sort -> join -> sha256
+                              ├─ hash == baseline   -> "No change." -> exit 0
+                              ├─ no baseline yet    -> establish it, stay quiet
+                              ├─ pre-Phase-2 state  -> re-baseline quietly
+                              └─ hash != baseline   -> Telegram, worded by
+                                                       transition -> exit 0
                           └─> commit last_seen.json back to main
 ```
 
@@ -417,11 +512,12 @@ tazkarti-bot/
 │   └── workflows/
 │       └── monitor.yml              ✅ cron */10 + workflow_dispatch
 ├── .vscode/                         ✅ editor config
-├── alahly_ticket_check.py           ⚠️ CI single-run — rewrite pending
+├── alahly_ticket_check.py           ✅ CI single-run — SOURCE OF TRUTH for the shared block
 ├── alahly_ticket_monitor.py         ✅ local loop — reference implementation
 ├── alahly_ticket_prefill.py         ⬜ local helper — all selectors TODO
+├── sync_shared_block.py             ✅ copies + verifies the shared block (rule 13)
 ├── get_telegram_chat_id.py          ✅ one-shot setup helper
-├── last_seen.json                   ⚠️ committed state — currently empty-string hash
+├── last_seen.json                   ✅ committed state — v3, hashes raw matchStatus
 ├── env.example                      ✅ template
 ├── .gitignore                       ✅ must contain .env
 ├── debug/                           ⬜ created at runtime on failure, NOT committed
@@ -432,26 +528,40 @@ tazkarti-bot/
 
 ## State File Schema (`last_seen.json`)
 
-**Current (v1):**
-```json
-{"hash": "<sha256 hex>"}
-```
-
-**Target (v2, in the rewritten script):**
+**Current (v3, since 2026-08-25 — Phase 2):**
 ```json
 {
-  "hash": "<sha256 of sorted, newline-joined fixture list>",
-  "matches": ["Al Ahly vs Zamalek", "Pyramids vs Al Ahly"],
+  "hash": "<sha256 of the sorted, newline-joined match payloads>",
+  "matches": [
+    {
+      "match_id": 2559,
+      "fixture": "ZED FC vs Al Ahly FC",
+      "status": 1,
+      "status_label": "AVAILABLE",
+      "status_badge": "Available",
+      "status_class": "green"
+    }
+  ],
   "consecutive_failures": 0,
   "last_error": null,
-  "updated_at": "2026-08-24T15:13:00+00:00"
+  "updated_at": "2026-08-25T14:39:32+00:00"
 }
 ```
 
+Superseded: **v1** `{"hash": ...}`; **v2** the same shape as v3 but with `matches` as a list of
+plain fixture STRINGS and a hash covering only those names.
+
 Rules:
-- `matches` exists so alerts can say `+ Al Ahly vs Zamalek` instead of dumping the whole list.
-- `hash` is computed over the **sorted** list. Unsorted hashing makes a mere reordering of the
-  page look like a change and fires a false alert.
+- **`matches` is a list of objects, not strings.** A v2 state is detected (`any(isinstance(m,
+  str) ...)`) and migrated by re-establishing the baseline **quietly** — the old hash covered
+  fixture names only and is not comparable, so alerting on it would be alerting on a format
+  change. Both scripts do this.
+- **`status` is Tazkarti's RAW `matchStatus` integer.** Only `status` and `match_id` and
+  `fixture` reach the hash — see `match_payload()`. `status_label` / `status_badge` /
+  `status_class` are diagnostics and alert wording, and are deliberately NOT hashed:
+  `status_label` is derived from `status`, and the badge fields are language-dependent.
+- `hash` is computed over the **sorted** payloads. Unsorted hashing makes a mere reordering of
+  the page look like a change and fires a false alert.
 - On scrape failure, `hash` and `matches` are **left untouched** and only
   `consecutive_failures` / `last_error` are updated. Overwriting a good baseline with a failure
   result causes a bogus "change detected" alert the moment the scraper recovers.
@@ -527,17 +637,30 @@ name by hand and paste only into the Value field.
     boundary is deliberate and documented in the prefill docstring; leave that docstring intact.
 12. **Be polite to the server.** 10 minutes in CI, 30 seconds locally, single client, no
     parallel requests, no proxy rotation.
-13. **Changes to scraping logic land in both scripts in the same commit.**
+13. **Changes to scraping logic land in both scripts in the same commit.** Do not hand-copy.
+    Edit the block in `alahly_ticket_check.py` between the `SHARED SCRAPE BLOCK` markers, then
+    run `python sync_shared_block.py`, and `python sync_shared_block.py --check` before
+    committing. Hand-copying is exactly how they drifted the first time.
 14. **`[skip ci]` on state commits** so the commit-back never causes surprises.
+15. **Hash the raw value, never a value you derived from it.** Change detection runs on
+    Tazkarti's own `matchStatus` integer; labels like `AVAILABLE` exist only to word the
+    alert. A derived label is lossy in the one direction that matters — an unrecognised state
+    funnelled into an existing label leaves the hash unmoved and the monitor silent about a
+    state it did not recognise, which is the empty-hash bug wearing a different hat.
+16. **Prefer a stable id over a name for identity.** Al Ahly is `teamId 77`, not a string
+    match. `NBE Club` is `نادى البنك الاهلى المصرى` and matches any sane "al ahly" pattern
+    without being Al Ahly at all.
 
 ---
 
 ## Feature Specs (Binding)
 
 ### Change detection
-Compare the SHA-256 of the sorted, newline-joined Al Ahly fixture list against the stored
-baseline. Alert on any difference. Do not alert when no baseline exists — establish it silently,
-so a fresh clone does not fire a spurious notification on its first run.
+Compare the SHA-256 of the sorted, newline-joined Al Ahly match payloads — `match_id`,
+`fixture`, and the **raw** `matchStatus` — against the stored baseline. Alert on any
+difference. Do not alert when no baseline exists, or when the stored baseline predates Phase 2
+— establish it silently, so neither a fresh clone nor a schema migration fires a spurious
+notification.
 
 ### Failure detection
 Zero total match cards on the page means failure, not emptiness. Alert on the first failure,
@@ -545,38 +668,131 @@ then once per hour (every 6th run at a 10-minute cadence) while it persists. Do 
 run — an unfixable notification every 10 minutes trains you to ignore the bot entirely.
 
 ### Alert content
-Telegram plain text. Show the delta (`+ added`, `- removed`), not the full list. Include the
-Tazkarti URL so it is one tap to act. Keep it short enough to read on a lock screen.
+Telegram plain text. Show the delta, not the full list. Include the Tazkarti URL so it is one
+tap to act. Keep it short enough to read on a lock screen.
 
-### Phase 2 — availability signal (not yet built)
-`.team-names` is the wrong element for "tickets are buyable" — it changes only when a fixture
-enters or leaves the listing.
-
-**Real selectors, read out of the `debug-11` artifact HTML on 2026-08-24. Not guessed.**
+**Different events must not read the same.** "Tickets are now on sale" and "a fixture was
+added" mean very different things to someone glancing at a notification. `describe_change()`
+emits these sections, most actionable first, so the important one survives truncation in a
+notification preview:
 
 ```
-.match                       match card root (inside an .ng-star-inserted wrapper)
+🎫 TICKETS ON SALE       any transition INTO matchStatus 1, and new fixtures already on sale
+🆕 FIXTURE ADDED         a new fixture that is not on sale yet
+🔒 NO LONGER ON SALE     a transition OUT of matchStatus 1
+ℹ️ STATUS CHANGED        any other transition, including UNKNOWN_STATUS_<n>
+❌ REMOVED FROM LISTING  the fixture is gone from the feed
+```
+
+If the hash moved but no transition explains it, say exactly that rather than inventing a
+reason.
+
+### Phase 2 — availability signal (BUILT 2026-08-25)
+
+**What is hashed:** `match_id \t fixture \t matchStatus`, sorted, SHA-256. `matchStatus` is
+Tazkarti's **raw integer**, never a label derived from it. Deriving first and hashing the
+derivation is lossy in the one direction that matters — an unrecognised status would fall
+through to an existing label, the hash would not move, and the monitor would go quiet on a
+state it did not recognise. That is the empty-hash bug in a new hat.
+
+**Where `matchStatus` comes from — this is NOT in the DOM.** The listing page fetches its own
+data from the public static file below and renders the cards from it. The rendered card only
+ever shows a colour class and a translated label, both derived from `matchStatus`:
+
+```
+https://www.tazkarti.com/data/matches-list-json.json?_=<cache-buster>
+```
+
+The script captures the response the page already requested (`page.on("response")`, registered
+before `goto()`), so it makes **no extra request of its own** — rule 12 is intact. Relevant
+fields per row: `matchId`, `matchStatus`, `teamId1`/`teamId2`, `teamName1`/`teamName2`,
+`teamNameAr1`/`teamNameAr2`, `showInPortal`, `isDeleted`.
+
+**The four status values — complete, read out of the compiled Angular bundle
+`8.7c7ab3ab9f9641d7d4c4.js` and `assets/i18n/{en,ar,fr}.json`, NOT guessed:**
+
+| `matchStatus` | Badge class | English | Arabic | French | Token used in alerts |
+|---|---|---|---|---|---|
+| 1 | `status green` | `Available` | `متاح` | `Disponible` | `AVAILABLE` |
+| 2 | `status red` | `Match Ended` | `انتهت المباراة` | `Match terminé` | `MATCH_ENDED` |
+| 3 | `status red` | `Booking Closed` | `تم غلق الحجز` | `Réservation fermée` | `BOOKING_CLOSED` |
+| 4 | `status red` | `Coming Soon` | `قريبًا` | `Bientôt disponible` | `COMING_SOON` |
+
+The template that produces them, decompiled:
+
+```js
+// badge (node 66/67)
+<div class="status" [class.green]="matchStatus==1"
+                    [class.red]="matchStatus==2||==3||==4">
+  {{ matchStatus==1 ? 'Available'   : matchStatus==2 ? 'NotAvailable'
+   : matchStatus==3 ? 'FullBooking' : 'MatchComingSoon' | translate }}
+```
+
+Anything outside 1–4 renders as `Coming Soon` (it is the `else` branch) but still hashes
+distinctly, and `status_label()` reports it as `UNKNOWN_STATUS_<n>`.
+
+**Why the badge and not the Book Ticket button.** Both were examined. The button loses twice:
+
+```js
+// button (node 37/40) -- class is STATIC "button button-green width-auto"
+[disabled] = (matchStatus!=1 && matchStatus!=4)
+          || (matchStatus==4 && !isSystemFan)
+          || startBooking
+```
+
+Its colour class never changes, so it is green even when booking is closed; and its `disabled`
+also depends on login state (`isSystemFan`) and a transient per-card `startBooking` flag. The
+badge is a function of `matchStatus` alone. **Do not switch the signal to the button.**
+
+**Noise that is deliberately excluded from the hash.** The page carries two hidden
+virtual-queue templates that are also `.match` elements — blank team names, no `.status`, and
+text including `People waiting`, `Approx. waiting time`, and `Last update time : 05 : 13 PM`.
+That clock ticks every minute; it was observed changing `05:12 PM` → `05:13 PM` between two
+runs a minute apart. Hashing card text wholesale would fire an alert on every single run.
+Cards with no team name are skipped, which drops them. Verified: four consecutive live polls
+produced an identical hash.
+
+**Al Ahly identification is by team id, not by name.** `AL_AHLY_TEAM_ID = 77`. The name test
+is kept only as a fallback so a reissued id is noisy rather than silent. `DECOY_TEAM_IDS` is
+load-bearing and NOT a nicety: `NBE Club` (teamId 171) is `نادى البنك الاهلى المصرى` — the
+National Bank of Egypt — and `الاهلى` is just the Arabic word for "national", so it matches any
+reasonable "al ahly" pattern. Without the decoy list every NBE fixture is tracked as an Al Ahly
+one. This was caught by a test asserting the fixture count, not by reading the code.
+
+**DOM/feed cross-check.** The number of rendered fixture cards must equal the number of feed
+rows (after dropping `showInPortal: false` / `isDeleted: true`); a mismatch raises. This is an
+independent guard on the pagination fix — with `View More` disabled it correctly reports
+`rendered 6 ... feed lists 10`.
+
+---
+
+**DOM selectors, originally read out of the `debug-11` artifact HTML on 2026-08-24 and
+re-confirmed against a fresh dump on 2026-08-25. Not guessed.**
+
+```
+.match                       match card root — iterate THIS, not .team-names
   .top.clearfix
     .teams
-      .team-names            <- what the scrape currently targets
+      .team-names            fixture name; blank on the queue templates
         .team-name.first
         .team-name.second
+    .blocks
+      button.button.button-green.width-auto    "Book Ticket" — NOT the signal, see above
   .bottom
     .one > .first            metadata label ("Tournament", "Match No.", "Group :")
     .one > .second           metadata value
-    .status                  AVAILABILITY BADGE  <- the Phase 2 signal
+    .status                  AVAILABILITY BADGE — cross-check + alert wording only
 ```
 
 Observed markup: `<div class="status green"> Available </div>`. The colour is a second class
 on the same element, so `.status` carries the text and `.status.green` encodes the state.
 
-**Only `green` / `Available` has been observed.** Sold-out and coming-soon variants have never
-been seen, so do NOT hardcode a state list — read both the text and the class list, and alert
-on the transition rather than on a matched constant.
+Iterate `.match` and skip cards whose team names are blank. Iterating `.team-names` directly
+picks up the two hidden queue templates, which have one but no `.status`.
 
 Also in the markup: the load-more control, `button.button.button-blue.width-auto` with the
-text `View More`, which reports `disabled` once the list is exhausted. That button is the
-Known Bug at the top of this file.
+text `View More`, which reports `disabled` once the list is exhausted. It is selected by class
+rather than text so it survives an Arabic render; see the pagination record above.
 
 The booking modal is `#book-ticket-modal`, containing `.book-second-step` and
 `.book-ticket-modal-footer`. That is Phase 3 territory and is still unverified.
@@ -611,8 +827,19 @@ python alahly_ticket_check.py
 # Reset the baseline (forces the next run to re-establish it):
 rm last_seen.json
 
-# Force an alert, to test the Telegram path end-to-end:
-# edit last_seen.json and change one character of the hash, then run.
+# Force an alert, to test the Telegram path end-to-end.
+# Since Phase 2 the hash covers matchStatus, so change the STATUS, not the
+# hash -- that way the alert text exercises a real transition:
+#   in last_seen.json, set the tracked fixture's "status" to 4, then run.
+#   Expect: "TICKETS ON SALE: ZED FC vs Al Ahly FC (COMING_SOON -> AVAILABLE)"
+# Changing a character of the hash still fires, but produces the
+# no-transition-identified wording instead, which tests less.
+
+# ── CHANGING THE SCRAPER (rule 13) ───────────────────────────────
+# Edit ONLY alahly_ticket_check.py, between the SHARED SCRAPE BLOCK
+# markers. Then:
+python sync_shared_block.py           # copy into the monitor + verify
+python sync_shared_block.py --check   # run before every commit
 ```
 
 ---
@@ -650,13 +877,32 @@ rm last_seen.json
 of 10 fixtures and missing the only Al Ahly match on the site. When adding a phase, ask what a
 passing suite would still fail to notice, and write that down as a criterion.**
 
+**Acceptance criteria for Phase 2 — all six, verified locally 2026-08-25:**
+- [x] The scrape returns structured objects carrying a raw `matchStatus`, not strings —
+      `{"match_id": 2559, "fixture": "ZED FC vs Al Ahly FC", "status": 1, ...}`
+- [x] Changing only `matchStatus` moves the hash — `a086020c` → `063ae110`
+- [x] An **unrecognised** `matchStatus` (99) also moves the hash — this is the criterion that
+      forced hashing the raw integer instead of the derived label
+- [x] Repeated live runs produce an identical hash, so no live-updating text is in it —
+      four consecutive polls, all `a086020c641a`
+- [x] The alert distinguishes the events — `TICKETS ON SALE` / `FIXTURE ADDED` /
+      `NO LONGER ON SALE` / `REMOVED`, with the most actionable section first
+- [x] A partial listing is refused by comparing the rendered card count to the feed —
+      `rendered 6 ... feed lists 10` when `View More` is suppressed
+- [ ] **A Phase 2 alert delivered to Telegram.** NOT yet done. See Not Yet Verified.
+
+**Asking what a passing suite would still miss is what caught two bugs this time.** The
+count-asserting test caught `NBE Club` being tracked as an Al Ahly fixture; running the local
+monitor for more than one poll caught the SPA never reloading. Neither would have been found by
+reading the code, and the second had been latent since Phase 0.
+
 ---
 
 ## v2+ Future Enhancements (Do NOT Build Now)
 
 | Enhancement | Design consideration for today |
 |---|---|
-| Ticket-availability signal instead of fixture-list | Phase 2. Keep the scrape function returning a structured list, not a string, so adding a `status` field per match is additive. |
+| ~~Ticket-availability signal instead of fixture-list~~ | ✅ BUILT 2026-08-25. See Feature Specs → Phase 2. |
 | Self-hosted runner in Egypt | The fallback if the geo-block hypothesis is confirmed. A Raspberry Pi or a cheap always-on box running the *local* script is simpler than a self-hosted Actions runner — prefer it. |
 | Multiple teams | Filter predicate is already isolated in the page script. Make it a list of patterns, not a hardcoded one. |
 | Per-match alert routing | Telegram supports multiple chat IDs. `CHAT_ID` would become a comma-separated list. |

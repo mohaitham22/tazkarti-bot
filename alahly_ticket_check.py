@@ -3,27 +3,39 @@ Al Ahly Tazkarti Ticket Check (single run, for GitHub Actions)
 ------------------------------------------------------------------
 Checks Tazkarti ONCE, compares against the last known state
 (last_seen.json in this repo), and sends a Telegram alert if the
-Al Ahly listing changed. Then exits.
+availability of an Al Ahly fixture changed. Then exits.
 
-Key difference from the first version: this one can tell the
-difference between "no Al Ahly matches listed" and "the scrape
-broke". The old version produced an empty string in both cases,
-which hashed identically to the stored baseline -- so a broken
-scraper reported "No change." forever while the job stayed green.
+Phase 2 changed what "changed" means. The old signal was the Al Ahly
+fixture LIST: it moved when a match entered or left the listing, and sat
+perfectly still when tickets for an already-listed match went on sale --
+which is the one moment this project exists to catch. The signal is now
+each fixture's matchStatus.
 
-How it distinguishes them: it counts EVERY match card on the page,
-not just the Al Ahly ones.
-    - 0 cards total          -> page never rendered. Something is
-                                wrong (blocked, geo-restricted,
-                                markup changed). Alert + exit 1.
+Where matchStatus comes from: the listing page fetches its own data from
+the public static file /data/matches-list-json.json and renders the cards
+from it. That payload is the only place the raw integer exists -- the DOM
+only ever shows a colour class and a translated label, both derived from
+it. This script reads the response the page already requested, so it
+costs the server no extra request.
+
+Change detection runs on the RAW integer, never on a label derived from
+it. A derived label is lossy in the one direction that matters: a
+matchStatus this script has never seen would fall through to some
+existing label, the hash would not move, and the monitor would go quiet
+on a state it did not recognise. That is the empty-hash bug in a new hat.
+
+It can also still tell "no Al Ahly matches listed" apart from "the scrape
+broke", by counting EVERY match card on the page:
+    - 0 cards total          -> page never rendered. Alert + exit 1.
     - N cards, 0 Al Ahly     -> genuinely no Al Ahly fixtures. Quiet.
 
-On failure it does NOT overwrite the stored hash, so a temporary
-block can't destroy a good baseline and cause a bogus "change"
-alert when it recovers.
+On failure it does NOT overwrite the stored hash, so a temporary block
+can't destroy a good baseline and cause a bogus "change" alert when it
+recovers.
 """
 
 import os
+import re
 import sys
 import json
 import hashlib
@@ -40,9 +52,6 @@ TZK_URL = os.environ.get("TZK_URL", "https://www.tazkarti.com/#/matches")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-STATE_FILE = "last_seen.json"
-DEBUG_DIR = "debug"
-
 # Re-alert about a persistent failure every N runs so you get one
 # nudge per hour at a 10-minute cadence, not one every 10 minutes.
 FAILURE_REALERT_EVERY = 6
@@ -55,8 +64,58 @@ USER_AGENT = (
 )
 
 
+# ====================================================================
+# BEGIN SHARED SCRAPE BLOCK (rule 13)
+# Byte-identical in alahly_ticket_check.py and alahly_ticket_monitor.py.
+# Never edit one copy by hand -- edit the copy in alahly_ticket_check.py
+# and then run
+#     python sync_shared_block.py
+# which copies it across and verifies the two are identical. Hand-copying
+# is how these two files drifted apart in the first place.
+# ====================================================================
+
+STATE_FILE = "last_seen.json"
+DEBUG_DIR = "debug"
+
+
 class ScrapeError(RuntimeError):
     """The page did not render usable content."""
+
+
+# --------------------------------------------------------------------
+# status vocabulary
+# --------------------------------------------------------------------
+# Read out of Tazkarti's own compiled Angular bundle (8.*.js) on
+# 2026-08-25, not guessed. The match card template is:
+#
+#   <div class="status" [class.green]="matchStatus==1"
+#                       [class.red]="matchStatus==2||==3||==4">
+#     {{ matchStatus==1 ? 'Available'   : matchStatus==2 ? 'NotAvailable'
+#      : matchStatus==3 ? 'FullBooking' : 'MatchComingSoon' | translate }}
+#   </div>
+#
+# and those i18n keys resolve through assets/i18n/{en,ar,fr}.json to:
+#
+#   raw  key              en               ar                fr
+#   1    Available        Available        (matah)           Disponible
+#   2    NotAvailable     Match Ended      (intahat...)      Match termine
+#   3    FullBooking      Booking Closed   (tam ghalq...)    Reservation fermee
+#   4    MatchComingSoon  Coming Soon      (qariban)         Bientot disponible
+#
+# These labels are for WORDING ALERTS ONLY. Change detection runs on the
+# raw integer -- see match_payload().
+STATUS_AVAILABLE = 1
+STATUS_LABELS = {
+    1: "AVAILABLE",
+    2: "MATCH_ENDED",
+    3: "BOOKING_CLOSED",
+    4: "COMING_SOON",
+}
+
+
+def status_label(raw) -> str:
+    """Human token for a raw matchStatus. Never used for change detection."""
+    return STATUS_LABELS.get(raw, f"UNKNOWN_STATUS_{raw}")
 
 
 # --------------------------------------------------------------------
@@ -83,32 +142,155 @@ def save_state(state: dict) -> None:
 
 
 # --------------------------------------------------------------------
-# scraping
+# Arabic normalisation (rule 6)
+# --------------------------------------------------------------------
+# The hamza forms of alef and the two yaa forms are interchangeable in
+# Tazkarti's data depending on the source, so fold them and strip
+# diacritics before comparing team names.
+_ARABIC_FOLD = {
+    0x0623: "ا", 0x0625: "ا", 0x0622: "ا", 0x0671: "ا",
+    0x0649: "ي",
+}
+_AL_AHLY_AR = "الاهلي"   # "al-ahly", normalised
+
+
+def normalise_arabic(text: str) -> str:
+    folded = (text or "").translate(_ARABIC_FOLD)
+    return "".join(c for c in folded if not "ً" <= c <= "ْ")
+
+
+def is_al_ahly(text: str) -> bool:
+    return bool(re.search(r"al\s*ahly", text or "", re.I)) or \
+        _AL_AHLY_AR in normalise_arabic(text)
+
+
+# --------------------------------------------------------------------
+# which fixtures are ours
+# --------------------------------------------------------------------
+# Al Ahly FC is teamId 77 in Tazkarti's feed. Matching on the id is exact
+# and survives both a rename and the site being served in another
+# language. Re-derive by fetching /data/matches-list-json.json and
+# reading teamId1 / teamId2 off a fixture you know is Al Ahly's.
+AL_AHLY_TEAM_ID = 77
+
+# Clubs whose NAME matches an "al ahly" test but which are not Al Ahly
+# FC. This is not a nicety: NBE Club is "نادى البنك الاهلى المصرى" --
+# the National Bank of Egypt -- and "الاهلى" is simply the Arabic word
+# for "national". Without this, every NBE fixture is tracked as an Al
+# Ahly one. Found when the name test started reading Arabic names and
+# quietly returned two fixtures where there was one.
+DECOY_TEAM_IDS = {
+    171: "NBE Club -- National Bank of Egypt, not Al Ahly FC",
+}
+
+
+def is_al_ahly_row(row: dict) -> bool:
+    """Is this feed row an Al Ahly fixture?
+
+    Team id first, because it is exact. The name test is kept as a
+    fallback so that a reissued team id leaves the monitor noisy rather
+    than silent -- silence is the failure this project keeps having, and
+    a spurious extra fixture is both visible and trivially fixed by
+    adding its id to DECOY_TEAM_IDS.
+
+    The fallback runs per side, skipping only the decoy team itself
+    rather than rejecting the whole fixture, so an Al Ahly match against
+    NBE is still caught even if Al Ahly's own id changed.
+    """
+    if AL_AHLY_TEAM_ID in (row.get("teamId1"), row.get("teamId2")):
+        return True
+
+    for id_key, name_keys in (
+        ("teamId1", ("teamName1", "teamNameAr1")),
+        ("teamId2", ("teamName2", "teamNameAr2")),
+    ):
+        if row.get(id_key) in DECOY_TEAM_IDS:
+            continue
+        if any(is_al_ahly(str(row.get(k) or "")) for k in name_keys):
+            return True
+    return False
+
+
+# --------------------------------------------------------------------
+# hashing
 # --------------------------------------------------------------------
 
-# Arabic normalisation: Tazkarti may render "الأهلي" or "الاهلي" or
-# "الأهلى" depending on the data source. Strip hamza forms and
-# diacritics, and fold alef-maqsura to yaa, before comparing.
+def match_payload(m: dict) -> str:
+    """The exact bytes change detection runs on.
+
+    Identity plus the RAW matchStatus, and nothing else. Everything else
+    on a card is either derived from this integer (the badge colour and
+    its translated label) or outright noise: the same page carries two
+    hidden virtual-queue templates whose "Last update time" clock ticks
+    every minute, which would fire an alert on every single run if it
+    ever reached the hash.
+    """
+    return f"{m.get('match_id')}\t{m.get('fixture')}\t{m.get('status')}"
+
+
+def compute_hash(matches: list) -> str:
+    """SHA-256 over the sorted payloads (rule 5 -- always sort)."""
+    body = "\n".join(match_payload(m) for m in sorted(matches, key=match_payload))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------
+# scraping
+# --------------------------------------------------------------------
+# Selectors live here, together, with a note on how to re-derive them
+# (rule 8). To re-derive: open https://www.tazkarti.com/#/matches, click
+# "View More" until it disables, then inspect one card:
+#
+#   .match                        card root
+#     .top .teams .team-names
+#       .team-name.first  /  .team-name.second
+#     .blocks button.button.button-green.width-auto     "Book Ticket"
+#     .bottom .status                                   availability badge
+#
+# The badge is captured for cross-checking and alert wording only, NOT
+# for change detection -- see match_payload(). The Book Ticket button is
+# deliberately ignored: its colour class is static (green even when
+# booking is closed) and its disabled property also depends on login
+# state and a transient per-card startBooking flag.
+#
+# Two of the .match elements on the page are hidden virtual-queue
+# templates rather than fixtures: blank team names, no .status, and text
+# like "People waiting" / "Last update time : 05 : 13 PM". Cards with no
+# team name are skipped, which drops them.
 PAGE_SCRIPT = """
 () => {
-    const norm = (t) => (t || '')
-        .replace(/[\\u0623\\u0625\\u0622\\u0671]/g, '\\u0627')  // أإآٱ -> ا
-        .replace(/\\u0649/g, '\\u064A')                          // ى -> ي
-        .replace(/[\\u064B-\\u0652]/g, '');                      // diacritics
+    const clean = (t) => (t || '').replace(/\\s+/g, ' ').trim();
 
-    const cards = Array.from(document.querySelectorAll('.team-names'));
+    const cards = [];
+    for (const card of Array.from(document.querySelectorAll('.match'))) {
+        const names = card.querySelector('.team-names');
+        if (!names) continue;
 
-    const all = cards.map(el => {
-        const first  = el.querySelector('.team-name.first')?.innerText.trim()  || '';
-        const second = el.querySelector('.team-name.second')?.innerText.trim() || '';
-        return (first + ' vs ' + second).trim();
-    }).filter(m => m !== 'vs');
+        const firstEl  = names.querySelector('.team-name.first');
+        const secondEl = names.querySelector('.team-name.second');
+        const first  = clean(firstEl  ? firstEl.innerText  : '');
+        const second = clean(secondEl ? secondEl.innerText : '');
+        // No team name at all -> hidden queue template, not a fixture.
+        if (!first && !second) continue;
 
-    const isAlAhly = (t) => /al\\s*ahly/i.test(t) || norm(t).includes('\\u0627\\u0644\\u0627\\u0647\\u0644\\u064A');
-
-    return { total: all.length, alAhly: all.filter(isAlAhly) };
+        const badge = card.querySelector('.status');
+        cards.push({
+            fixture: (first + ' vs ' + second).trim(),
+            badge_text: badge ? clean(badge.innerText) : null,
+            badge_class: badge
+                ? (Array.from(badge.classList).filter(c => c !== 'status').join(' ') || null)
+                : null
+        });
+    }
+    return { total: cards.length, cards: cards };
 }
 """
+
+# The page fetches its own listing data from this public static file and
+# renders the cards from it. It is the only place the raw matchStatus
+# integer appears. Reading the response the page already requested adds
+# no load of our own (rule 12).
+MATCHES_JSON_FRAGMENT = "matches-list-json"
 
 
 def dump_evidence(page, tag: str) -> None:
@@ -180,38 +362,211 @@ def load_all_pages(page) -> int:
 
 
 def fetch_al_ahly_matches(page) -> list:
-    """Return the sorted list of Al Ahly fixtures, or raise ScrapeError."""
-    page.goto(TZK_URL, wait_until="domcontentloaded", timeout=45000)
+    """Return the sorted Al Ahly fixtures, each with its raw status.
 
+    Every element is {match_id, fixture, status, status_label,
+    status_badge, status_class}, where `status` is Tazkarti's raw
+    matchStatus integer. Raises ScrapeError rather than returning
+    anything it cannot vouch for.
+    """
+    captured = []
+
+    def on_response(response):
+        if MATCHES_JSON_FRAGMENT not in response.url:
+            return
+        try:
+            body = response.json()
+        except Exception:
+            return          # not JSON, or the body is already gone
+        if isinstance(body, list) and body:
+            captured.append(body)
+
+    # Registered before goto() -- the page fetches its listing data during
+    # navigation. Removed again in the finally so the local monitor's loop
+    # doesn't accumulate one handler per poll.
+    page.on("response", on_response)
     try:
-        page.wait_for_selector(".team-names", timeout=25000)
-    except PlaywrightTimeout:
-        dump_evidence(page, "no-selector")
-        raise ScrapeError(
-            ".team-names never appeared within 25s. The page did not render "
-            "match cards -- likely blocked, geo-restricted, or the markup changed."
+        # about:blank first, so the next goto() is guaranteed to be a real
+        # load. TZK_URL is a hash route, and navigating to a URL that
+        # differs from the current one only after the "#" is a
+        # same-document navigation: the browser fires no page load,
+        # Angular never re-bootstraps, and the listing feed is never
+        # re-fetched. The local monitor reuses one page across polls, so
+        # without this its second and every later poll re-reads the DOM
+        # left over from the first one -- reporting "No change." forever
+        # no matter what happens on the site. Costs CI one navigation to
+        # a blank page and nothing else.
+        page.goto("about:blank")
+        page.goto(TZK_URL, wait_until="domcontentloaded", timeout=45000)
+
+        # wait_for_selector, never networkidle + a fixed sleep: on an SPA
+        # networkidle can resolve before Angular paints (rule 7).
+        try:
+            page.wait_for_selector(".team-names", timeout=25000)
+        except PlaywrightTimeout:
+            dump_evidence(page, "no-selector")
+            raise ScrapeError(
+                ".team-names never appeared within 25s. The page did not render "
+                "match cards -- likely blocked, geo-restricted, or the markup changed."
+            )
+
+        # Separate wait, separate error. ".team-names but no .status" means
+        # the page rendered and the availability signal specifically is
+        # gone, which is a different problem from the page not rendering.
+        try:
+            page.wait_for_selector(".status", timeout=15000)
+        except PlaywrightTimeout:
+            dump_evidence(page, "no-status")
+            raise ScrapeError(
+                "Match cards rendered but no .status badge appeared within 15s. "
+                "The availability markup changed -- re-derive the selector before "
+                "trusting any result."
+            )
+
+        # Load every page BEFORE parsing, or the scrape silently covers
+        # only the first one.
+        try:
+            clicks = load_all_pages(page)
+        except ScrapeError:
+            dump_evidence(page, "load-more")
+            raise
+
+        dom = page.evaluate(PAGE_SCRIPT)
+
+        dom_total = dom["total"]
+        if dom_total == 0:
+            dump_evidence(page, "zero-cards")
+            raise ScrapeError("Selector matched but zero match cards parsed.")
+
+        if not captured:
+            dump_evidence(page, "no-json")
+            raise ScrapeError(
+                f"The page never fetched '{MATCHES_JSON_FRAGMENT}'. The raw "
+                "matchStatus lives only in that payload, so availability cannot "
+                "be established -- refusing to fall back to the badge text."
+            )
+
+        rows = [r for r in captured[-1]
+                if r.get("showInPortal", True) and not r.get("isDeleted", False)]
+
+        # An independent check on the pagination fix: the feed knows the
+        # true number of fixtures, so if the DOM shows fewer then
+        # "View More" left the listing partial. This is the kind of
+        # criterion the original Phase 1 test suite lacked.
+        if len(rows) != dom_total:
+            dump_evidence(page, "dom-json-mismatch")
+            raise ScrapeError(
+                f"The page rendered {dom_total} fixture card(s) but its data feed "
+                f"lists {len(rows)}. Either 'View More' left the listing partial "
+                "or the feed and the page disagree. Refusing to report either "
+                "as complete."
+            )
+    finally:
+        page.remove_listener("response", on_response)
+
+    badges = {c["fixture"]: c for c in dom["cards"]}
+
+    matches = []
+    for row in rows:
+        if not is_al_ahly_row(row):
+            continue
+        english = f"{row.get('teamName1', '')} vs {row.get('teamName2', '')}".strip()
+        arabic = f"{row.get('teamNameAr1', '')} vs {row.get('teamNameAr2', '')}".strip()
+
+        # The card renders whichever language the app is set to, so try
+        # both keys. Diagnostics only -- a miss here is never fatal.
+        badge = badges.get(english) or badges.get(arabic) or {}
+        raw = row.get("matchStatus")
+        matches.append({
+            "match_id": row.get("matchId"),
+            "fixture": english,
+            "status": raw,
+            "status_label": status_label(raw),
+            "status_badge": badge.get("badge_text"),
+            "status_class": badge.get("badge_class"),
+        })
+
+    matches.sort(key=match_payload)
+
+    print(f"Parsed {dom_total} match cards after {clicks} 'View More' click(s), "
+          f"{len(matches)} of them Al Ahly.")
+    for m in matches:
+        print(f"  {m['fixture']} -- {m['status_label']} "
+              f"(matchStatus={m['status']}, badge={m['status_badge']!r})")
+    return matches
+
+
+# --------------------------------------------------------------------
+# alert wording
+# --------------------------------------------------------------------
+
+def describe_change(old: list, new: list) -> str:
+    """Say what actually changed, in words that mean different things.
+
+    "Tickets are now on sale" and "a fixture was added" are not the same
+    event and must not read the same on a lock screen. The most
+    actionable section is emitted first so it survives truncation in a
+    notification preview.
+    """
+    old_by_id = {m.get("match_id"): m for m in old if isinstance(m, dict)}
+    new_by_id = {m.get("match_id"): m for m in new if isinstance(m, dict)}
+
+    on_sale, added, closed, other, removed = [], [], [], [], []
+
+    for mid, m in new_by_id.items():
+        fixture = m.get("fixture")
+        now = m.get("status")
+        now_label = m.get("status_label") or status_label(now)
+        previous = old_by_id.get(mid)
+
+        if previous is None:
+            if now == STATUS_AVAILABLE:
+                on_sale.append(f"  {fixture}  (new fixture, already on sale)")
+            else:
+                added.append(f"  {fixture}  ({now_label})")
+            continue
+
+        was = previous.get("status")
+        if was == now:
+            continue
+        was_label = previous.get("status_label") or status_label(was)
+
+        if now == STATUS_AVAILABLE:
+            on_sale.append(f"  {fixture}  ({was_label} -> AVAILABLE)")
+        elif was == STATUS_AVAILABLE:
+            closed.append(f"  {fixture}  (AVAILABLE -> {now_label})")
+        else:
+            other.append(f"  {fixture}  ({was_label} -> {now_label})")
+
+    for mid, m in old_by_id.items():
+        if mid not in new_by_id:
+            removed.append(f"  {m.get('fixture')}")
+
+    sections = []
+    if on_sale:
+        sections.append("\U0001F3AB TICKETS ON SALE:\n" + "\n".join(on_sale))
+    if added:
+        sections.append("\U0001F195 FIXTURE ADDED:\n" + "\n".join(added))
+    if closed:
+        sections.append("\U0001F512 NO LONGER ON SALE:\n" + "\n".join(closed))
+    if other:
+        sections.append("ℹ️ STATUS CHANGED:\n" + "\n".join(other))
+    if removed:
+        sections.append("❌ REMOVED FROM LISTING:\n" + "\n".join(removed))
+    if not sections:
+        # The hash moved but no transition explains it -- a fixture was
+        # renamed, or a match id was reissued. Say that, rather than
+        # inventing a reason.
+        sections.append(
+            "Tracked details changed with no status transition "
+            "(fixture renamed, or match id reissued)."
         )
+    return "\n\n".join(sections)
 
-    # Load every page BEFORE parsing, or the scrape silently covers only
-    # the first one.
-    try:
-        clicks = load_all_pages(page)
-    except ScrapeError:
-        dump_evidence(page, "load-more")
-        raise
 
-    result = page.evaluate(PAGE_SCRIPT)
-    total = result["total"]
-    al_ahly = result["alAhly"]
-
-    if total == 0:
-        dump_evidence(page, "zero-cards")
-        raise ScrapeError("Selector matched but zero match cards parsed.")
-
-    print(f"Parsed {total} match cards after {clicks} 'View More' click(s), "
-          f"{len(al_ahly)} of them Al Ahly.")
-    # Sorted so a mere reordering of the listing doesn't look like a change.
-    return sorted(al_ahly)
+# ====================================================================
+# END SHARED SCRAPE BLOCK (rule 13)
+# ====================================================================
 
 
 # --------------------------------------------------------------------
@@ -240,19 +595,6 @@ def send_telegram(message: str) -> bool:
     except Exception as e:
         print("Telegram request errored:", e)
         return False
-
-
-def describe_change(old: list, new: list) -> str:
-    added = [m for m in new if m not in old]
-    removed = [m for m in old if m not in new]
-    lines = []
-    if added:
-        lines.append("NEW:\n" + "\n".join(f"  + {m}" for m in added))
-    if removed:
-        lines.append("GONE:\n" + "\n".join(f"  - {m}" for m in removed))
-    if not lines:
-        lines.append("Listing text changed (same fixtures).")
-    return "\n\n".join(lines)
 
 
 # --------------------------------------------------------------------
@@ -294,7 +636,7 @@ def main() -> int:
             print("SCRAPE FAILED:", e)
             if fails == 1 or fails % FAILURE_REALERT_EVERY == 0:
                 delivered = send_telegram(
-                    f"\u26A0\uFE0F Tazkarti monitor is not working "
+                    f"⚠️ Tazkarti monitor is not working "
                     f"(failure #{fails}).\n\n{e}\n\nNo ticket alerts will "
                     f"arrive until this is fixed.\n{TZK_URL}"
                 )
@@ -305,18 +647,28 @@ def main() -> int:
             if browser.is_connected():
                 browser.close()
 
-    content = "\n".join(matches)
-    current_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    current_hash = compute_hash(matches)
     last_hash = state.get("hash")
-    last_matches = state.get("matches", [])
+    stored = state.get("matches", [])
+    # Phase 1 stored plain fixture strings; Phase 2 stores objects.
+    legacy_state = any(isinstance(m, str) for m in stored)
+    last_matches = [m for m in stored if isinstance(m, dict)]
 
     recovered = state.get("consecutive_failures", 0) > 0
 
     if last_hash is None:
         print(f"Baseline established ({len(matches)} Al Ahly fixtures).")
+    elif legacy_state:
+        # The old hash covered fixture names only, so it is not comparable
+        # with one that covers matchStatus. Re-establish quietly rather
+        # than firing a "change" alert for what is only a format change
+        # (Feature Specs: establish a baseline silently).
+        print("Baseline migrated from the fixture-list signal to the "
+              "availability signal. The old hash covered fixture names only, "
+              "so it is not comparable -- re-establishing quietly instead of "
+              "alerting on a format change.")
     elif current_hash != last_hash:
         delivered = send_telegram(
-            "\U0001F534 Al Ahly listing changed on Tazkarti:\n\n"
             f"{describe_change(last_matches, matches)}\n\n{TZK_URL}"
         )
         if not delivered:
