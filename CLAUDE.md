@@ -189,11 +189,19 @@ three, so it could not previously have served as a reference for any of them.
   whole time. The vocabulary is not guesswork — it was read out of Tazkarti's own compiled
   template and i18n files (see Feature Specs) — but no transition has ever been *observed*.
   This is why the hash covers the raw integer: an unrecognised value still moves it.
-- **The `*/5` schedule actually running in CI.** The cron was changed 2026-08-25 but no
-  scheduled run has happened on it yet. Confirm from the Actions tab that runs are arriving as
-  `event: schedule`, and note the REAL gaps between them — if they still cluster at 8–45
-  minutes, that is the drift blocker, not a broken schedule, and nothing is wrong with the
-  config. Also worth one glance: `FAILURE_REALERT_EVERY = 12` has never fired at the new cadence.
+- ~~**The `*/5` schedule actually running in CI.**~~ **CONFIRMED 2026-08-26** from the Actions
+  tab: 56 runs, all green, all `Scheduled`, run #56 landing after the cron change. CI has never
+  stopped. **And it confirms the drift blocker rather than fixing it** -- state-commit gaps of
+  47, 39, 23 and 53 minutes, where the 53-minute one is AFTER `*/5` took effect. Tightening the
+  cron bought nothing measurable, exactly as predicted. Treat `*/5` as a request that GitHub
+  routinely ignores by 5-10x, and never as a 5-minute signal.
+
+  **READ TIMESTAMPS IN ONE TIMEZONE BEFORE DECLARING CI BROKEN.** This machine is GMT+3 and
+  Actions records commits in UTC, so `git log` (which renders the commit's own +0000) against a
+  local wall clock invents a 3-hour gap out of nothing. That produced a confident, wrong "CI has
+  not run in 3 hours" report. Use `--date=format-local:` to force local, or compare `updated_at`
+  (always UTC) against `date -u`. Compare like with like.
+
 - **Being signed in on the PHONE — DONE 2026-08-25 (user reported).** The alert links to
   `#/matches`, and Book Ticket there goes to `#/login` if that browser has no session — verified
   live. The user signed in on their phone, so a drop alert should now be one tap.
