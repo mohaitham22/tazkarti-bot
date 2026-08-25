@@ -1,8 +1,15 @@
 {
-  "hash": "8fbc667744a03512ea25c6a859414dff5c673f01b49d8529c1ae0bc29a761e89",
+  "hash": "a086020c641a23156a4dbc3e44e857f579fc2c0a1634f9c55de8bd41fa3166c5",
   "matches": [
-    "ZED FC vs Al Ahly FC"
+    {
+      "match_id": 2559,
+      "fixture": "ZED FC vs Al Ahly FC",
+      "status": 1,
+      "status_label": "AVAILABLE",
+      "status_badge": "Available",
+      "status_class": "green"
+    }
   ],
   "consecutive_failures": 0,
-  "updated_at": "2026-08-25T16:34:34+00:00"
+  "updated_at": "2026-08-25T17:09:18+00:00"
 }
