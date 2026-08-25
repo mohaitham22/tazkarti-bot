@@ -8,3 +8,14 @@ __pycache__/
 
 # Runtime debug evidence (screenshots + HTML dumps) -- never commit
 debug/
+
+# Local always-on runner keeps its baseline under LOCALAPPDATA, but guard
+# the in-repo fallback path too -- it must never collide with the CI state.
+last_seen_local.json
+
+# Prefill helper's persistent browser profile. It defaults to
+# %LOCALAPPDATA%\tazkarti-monitor\browser-profile (outside the repo and
+# outside OneDrive), but TZK_PROFILE_DIR can point anywhere -- and this
+# directory holds a LIVE Tazkarti session token. Given .env was once
+# committed to this public repo, guard the in-repo path too.
+browser-profile/

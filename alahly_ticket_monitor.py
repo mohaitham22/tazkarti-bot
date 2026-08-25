@@ -47,23 +47,88 @@ Run:
 
 import os
 import re
+import sys
 import time
 import json
+import socket
 import hashlib
+import logging
+import logging.handlers
 import datetime
 import requests
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-load_dotenv()  # reads .env in this folder, if present
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
-TZK_URL = os.environ["TZK_URL"]
+# An explicit path, not a bare load_dotenv(). Task Scheduler starts the
+# process with an arbitrary working directory, and dotenv's search falls
+# back to the cwd in some invocations -- an .env it fails to find then
+# surfaces much later as a confusing "missing TELEGRAM_BOT_TOKEN".
+load_dotenv(os.path.join(_HERE, ".env"))
+
+
+# --------------------------------------------------------------------
+# where the always-on local runner keeps its own files
+# --------------------------------------------------------------------
+# Deliberately NOT in the repo, for three separate reasons:
+#
+#   1. Separate baseline. The 30s local loop and the 10-minute CI job
+#      watch the same fixtures. Pointed at one state file they overwrite
+#      each other's hash, and each one's write then makes the other's
+#      next run see a change that never happened -- two runners
+#      cross-firing false alerts at each other forever.
+#   2. The repo is inside OneDrive. A 30-second loop rewriting a file
+#      there is ~2,880 uploads a day, and a sync lock landing on the one
+#      write that mattered is a real way to lose a baseline.
+#   3. CI commits its last_seen.json on every run. A local writer would
+#      be fighting `git pull --rebase` for the same file.
+LOCAL_DATA_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA") or _HERE, "tazkarti-monitor"
+)
+os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+
+# Read by the SHARED SCRAPE BLOCK below, which runs at import time, so
+# these have to be set BEFORE it. setdefault, so an explicit environment
+# value still wins -- that is how the verification runs point the script
+# at a throwaway state file.
+os.environ.setdefault(
+    "TZK_STATE_FILE", os.path.join(LOCAL_DATA_DIR, "last_seen_local.json")
+)
+os.environ.setdefault("TZK_DEBUG_DIR", os.path.join(LOCAL_DATA_DIR, "debug"))
+
+LOG_FILE = os.path.join(LOCAL_DATA_DIR, "monitor.log")
+
+TZK_URL = os.environ.get("TZK_URL", "https://www.tazkarti.com/#/matches")
 # An EMPTY value must fail exactly like a missing one -- an empty token
 # produces a 404 from Telegram that is easy to mistake for a network blip.
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
+HOSTNAME = socket.gethostname()
+
 POLL_SECONDS = 30   # be reasonable -- this is someone else's server
+
+# Failure handling, in polls. At 30s a poll: hold off alerting for the
+# first 3 minutes of trouble, because a single timeout is not news, then
+# re-state it hourly for as long as it stays broken. An unfixable
+# notification every 30 seconds trains you to swipe the bot away, which
+# is the one outcome that actually costs you a ticket.
+FAILURE_ALERT_AFTER = 6       # 6 x 30s = 3 minutes before the first alert
+FAILURE_REALERT_EVERY = 120   # then ~1 hour between repeats
+FAILURE_RETRY_EVERY = 10      # but retry ~5 min after an alert we could not send
+
+# A browser that has run for two hours is a browser that has had two
+# hours to leak. Recycling on a schedule is cheaper than diagnosing why
+# the poll went slow on day four.
+BROWSER_RECYCLE_POLLS = 240   # ~2 hours
+
+# A once-a-day "still here". The failure alert cannot fire if the machine
+# is asleep or the process is gone -- in those cases silence IS the
+# symptom, and a heartbeat is what turns silence into something you can
+# notice. Set TZK_HEARTBEAT_HOURS=0 to switch it off.
+HEARTBEAT_HOURS = float(os.environ.get("TZK_HEARTBEAT_HOURS", "24"))
+NOTIFY_ON_START = os.environ.get("TZK_NOTIFY_START", "1").strip() not in ("0", "", "no")
 
 # Same browser identity as CI, so that a difference in results is a real
 # difference and not an artefact of the two scripts looking different to
@@ -72,6 +137,77 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 )
+
+
+# --------------------------------------------------------------------
+# logging
+# --------------------------------------------------------------------
+
+class _LineTee:
+    """Mirror a text stream into the rotating log, a whole line at a time.
+
+    print() writes the text and its newline as two separate calls, so
+    buffering until a newline is what stops one log line becoming two.
+    """
+
+    def __init__(self, stream, logger):
+        self._stream = stream
+        self._logger = logger
+        self._buf = ""
+
+    def write(self, text):
+        if self._stream is not None:
+            try:
+                self._stream.write(text)
+            except Exception:
+                # A console that cannot encode what it is handed must not
+                # be able to kill the monitor. Arabic team names through a
+                # cp1252 console raise UnicodeEncodeError inside the
+                # print() itself -- down in the shared block, where there
+                # is no try/except to catch it.
+                try:
+                    self._stream.write(text.encode("ascii", "replace").decode("ascii"))
+                except Exception:
+                    pass
+        self._buf += text
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                self._logger.info(line)
+
+    def flush(self):
+        try:
+            if self._stream is not None:
+                self._stream.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+
+
+def install_logging() -> None:
+    """Tee stdout and stderr into a rotating file.
+
+    Under Task Scheduler there is no console at all, so without this every
+    print() in this script and in the shared block goes nowhere, and a
+    failure at 3am leaves nothing to read at 9am.
+    """
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8"
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s  %(message)s", "%Y-%m-%d %H:%M:%S")
+    )
+    logger = logging.getLogger("tazkarti.local")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(handler)
+    sys.stdout = _LineTee(sys.stdout, logger)
+    sys.stderr = _LineTee(sys.stderr, logger)
 
 
 # ====================================================================
@@ -84,8 +220,22 @@ USER_AGENT = (
 # is how these two files drifted apart in the first place.
 # ====================================================================
 
-STATE_FILE = "last_seen.json"
-DEBUG_DIR = "debug"
+# Both of these default to a path NEXT TO THIS SCRIPT rather than to the
+# process's working directory. Task Scheduler does not set a working
+# directory, so a bare relative path there writes the baseline into
+# C:\Windows\System32 instead of the repo -- and a baseline the next run
+# cannot find reads as "no baseline yet", which re-establishes silently
+# and loses the alert. CI is unaffected: it runs from the repo root, so
+# the resolved path is the same file it always was.
+#
+# TZK_STATE_FILE exists so the always-on local runner can keep its OWN
+# baseline. The 30s local loop and the 10-minute CI job watch the same
+# site; pointed at one file they overwrite each other's hash, and each
+# one's write makes the other's next run see a change that never
+# happened. Separate files, no cross-fire.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.environ.get("TZK_STATE_FILE") or os.path.join(_SCRIPT_DIR, "last_seen.json")
+DEBUG_DIR = os.environ.get("TZK_DEBUG_DIR") or os.path.join(_SCRIPT_DIR, "debug")
 
 
 class ScrapeError(RuntimeError):
@@ -133,22 +283,59 @@ def status_label(raw) -> str:
 # --------------------------------------------------------------------
 
 def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
+    """Read the baseline, and be LOUD if one exists but cannot be read.
+
+    The old version swallowed every error and returned {}, which the
+    callers cannot tell apart from "no baseline yet" -- so a corrupt file
+    silently re-established the baseline and threw away the alert that
+    was about to fire. That is rule 1 in a different costume, and the
+    local runner makes it likelier: it rewrites this file every 30
+    seconds, so an unclean shutdown has ~2,880 chances a day to catch a
+    half-written one. utf-8-sig because a state file that has been
+    through a Windows editor or PowerShell carries a BOM, which plain
+    utf-8 rejects.
+    """
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, encoding="utf-8-sig") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        # Not fatal -- refusing to run helps nobody. But say so, keep the
+        # unreadable file for post-mortem, and let the caller re-baseline
+        # knowing it happened rather than assuming a fresh install.
+        print(f"WARNING: {STATE_FILE} exists but could not be read ({e}). "
+              f"Re-establishing the baseline; ONE change may go unalerted.")
         try:
-            with open(STATE_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
+            os.replace(STATE_FILE, STATE_FILE + ".corrupt")
+            print(f"Kept the unreadable file as {STATE_FILE}.corrupt")
+        except OSError:
             pass
-    return {}
+        return {}
 
 
 def save_state(state: dict) -> None:
     state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat(
         timespec="seconds"
     )
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    # STATE_FILE may now live outside the repo (the local runner keeps its
+    # baseline under LOCALAPPDATA), so the directory is not guaranteed to
+    # exist on a first run.
+    parent = os.path.dirname(STATE_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    # Write-then-rename, so the baseline is never observed half-written.
+    # os.replace is atomic within a volume on Windows as well as POSIX.
+    # Without this, losing power partway through one of the local
+    # runner's writes leaves a truncated file that the next start cannot
+    # parse -- see load_state().
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_FILE)
 
 
 # --------------------------------------------------------------------
@@ -601,76 +788,278 @@ def send_telegram(message: str) -> bool:
 
 
 # --------------------------------------------------------------------
+# browser lifecycle
+# --------------------------------------------------------------------
+
+def new_browser(p):
+    """A fresh Chromium plus the one context/page the poll loop reuses."""
+    browser = p.chromium.launch(headless=True)
+    context = browser.new_context(
+        user_agent=USER_AGENT,
+        locale="ar-EG",
+        timezone_id="Africa/Cairo",
+        viewport={"width": 1366, "height": 900},
+    )
+    return browser, context, context.new_page()
+
+
+START_PING_MIN_GAP_SECONDS = 600
+
+
+def should_send_start_ping() -> bool:
+    """True at most once every 10 minutes.
+
+    The Task Scheduler watchdog relaunches this script within a minute of
+    it dying, so an unhandled crash occurring *after* start-up would
+    otherwise put a Telegram message on your phone every single minute,
+    forever. The reboot signal is worth having. A crash-loop broadcasting
+    it at 60 messages an hour is how you end up muting the bot on the one
+    day it matters.
+    """
+    stamp = os.path.join(LOCAL_DATA_DIR, "last-start-ping")
+    now = time.time()
+    try:
+        if now - os.path.getmtime(stamp) < START_PING_MIN_GAP_SECONDS:
+            print(f"Skipping the start-up ping -- one went out less than "
+                  f"{START_PING_MIN_GAP_SECONDS // 60} minutes ago. "
+                  f"Frequent restarts mean something is crashing; read the "
+                  f"log above rather than trusting the silence.")
+            return False
+    except OSError:
+        pass                      # no stamp yet, or unreadable -- ping.
+    try:
+        with open(stamp, "w", encoding="utf-8") as f:
+            f.write(str(now))
+    except OSError:
+        pass
+    return True
+
+
+def close_quietly(*things) -> None:
+    """Tear down without raising. Whatever is being closed may already be
+    dead -- that is usually the reason we are closing it."""
+    for thing in things:
+        if thing is None:
+            continue
+        try:
+            thing.close()
+        except Exception:
+            pass
+
+
+def maybe_alert_failure(poll, consecutive_failures, alert_due_at,
+                        failure_alerted, detail):
+    """Telegram once the loop has been failing for more than a few minutes.
+
+    Silent for the first FAILURE_ALERT_AFTER failures, because one timeout
+    is not news. After that, hourly -- an unfixable notification every 30
+    seconds is how you teach yourself to ignore the bot.
+
+    Returns the updated (alert_due_at, failure_alerted).
+    """
+    if consecutive_failures == FAILURE_ALERT_AFTER:
+        alert_due_at = poll
+    if alert_due_at is None or poll < alert_due_at:
+        return alert_due_at, failure_alerted
+
+    minutes = consecutive_failures * POLL_SECONDS // 60
+    sent = send_telegram(
+        f"⚠️ Local Tazkarti watcher has been failing for ~{minutes} min "
+        f"({consecutive_failures} polls in a row) on {HOSTNAME}.\n\n"
+        f"{detail}\n\n"
+        f"The 10-minute GitHub Actions check is separate and unaffected."
+    )
+    if sent:
+        return poll + FAILURE_REALERT_EVERY, True
+    # Could not send -- usually the same outage that broke the poll in the
+    # first place. Retry sooner than the hourly cadence, but do not hammer
+    # Telegram every 30 seconds while the network is down.
+    print("Could not deliver the failure alert; will retry shortly.")
+    return poll + FAILURE_RETRY_EVERY, failure_alerted
+
+
+# --------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------
 
-def main():
+def main() -> int:
+    install_logging()
+
     if not BOT_TOKEN or not CHAT_ID:
         raise SystemExit(
             "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are empty or unset -- "
             "check your .env file."
         )
 
-    print("Watching for Al Ahly ticket availability changes... (Ctrl+C to stop)")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=USER_AGENT,
-            locale="ar-EG",
-            timezone_id="Africa/Cairo",
-            viewport={"width": 1366, "height": 900},
+    print("=" * 70)
+    print(f"Local monitor starting on {HOSTNAME}. Polling every {POLL_SECONDS}s.")
+    print(f"  url    : {TZK_URL}")
+    print(f"  state  : {os.environ['TZK_STATE_FILE']}")
+    print(f"  debug  : {os.environ['TZK_DEBUG_DIR']}")
+    print(f"  log    : {LOG_FILE}")
+    print("=" * 70)
+
+    if NOTIFY_ON_START and should_send_start_ping():
+        # Worth a message: this also fires after a reboot, so its arrival
+        # is how you know the machine came back and the watcher with it.
+        send_telegram(
+            f"✅ Local Tazkarti watcher started on {HOSTNAME} "
+            f"(every {POLL_SECONDS}s)."
         )
-        page = context.new_page()
 
-        while True:
-            try:
-                matches = fetch_al_ahly_matches(page)
+    poll = 0
+    consecutive_failures = 0
+    alert_due_at = None      # poll index at which the next failure alert is due
+    failure_alerted = False
+    last_heartbeat = time.time()
 
-                state = load_state()
-                current_hash = compute_hash(matches)
-                last_hash = state.get("hash")
-                stored = state.get("matches", [])
-                # Phase 1 stored plain fixture strings; Phase 2 stores objects.
-                legacy_state = any(isinstance(m, str) for m in stored)
-                last_matches = [m for m in stored if isinstance(m, dict)]
+    with sync_playwright() as pw:
+        browser = context = page = None
+        polls_on_browser = 0
+        try:
+            while True:
+                # (Re)launch whenever there is no live page. Every failure
+                # path below drops the browser, so this doubles as the
+                # recovery path.
+                if page is None:
+                    try:
+                        browser, context, page = new_browser(pw)
+                        polls_on_browser = 0
+                        print("Launched a fresh Chromium.")
+                    except Exception as e:
+                        consecutive_failures += 1
+                        print(f"Could not launch Chromium "
+                              f"({consecutive_failures} in a row): {e!r}")
+                        alert_due_at, failure_alerted = maybe_alert_failure(
+                            poll, consecutive_failures, alert_due_at,
+                            failure_alerted, f"Chromium would not launch: {e}",
+                        )
+                        time.sleep(POLL_SECONDS)
+                        continue
 
-                delivered = True
-                if last_hash is None:
-                    print(f"Baseline established ({len(matches)} Al Ahly fixtures).")
-                elif legacy_state:
-                    # The old hash covered fixture names only, so it is not
-                    # comparable with one that covers matchStatus. Establish
-                    # the new baseline quietly rather than alerting on what
-                    # is only a format change.
-                    print("Baseline migrated from the fixture-list signal to the "
-                          "availability signal -- not comparable with the old "
-                          "hash, so re-establishing quietly.")
-                elif current_hash != last_hash:
-                    print("Change detected -- sending Telegram alert...")
-                    delivered = send_telegram(
-                        f"{describe_change(last_matches, matches)}\n\n{TZK_URL}"
+                poll += 1
+                polls_on_browser += 1
+
+                try:
+                    matches = fetch_al_ahly_matches(page)
+
+                    state = load_state()
+                    current_hash = compute_hash(matches)
+                    last_hash = state.get("hash")
+                    stored = state.get("matches", [])
+                    # Phase 1 stored plain fixture strings; Phase 2 stores objects.
+                    legacy_state = any(isinstance(m, str) for m in stored)
+                    last_matches = [m for m in stored if isinstance(m, dict)]
+
+                    delivered = True
+                    if last_hash is None:
+                        print(f"Baseline established ({len(matches)} Al Ahly fixtures).")
+                    elif legacy_state:
+                        # The old hash covered fixture names only, so it is not
+                        # comparable with one that covers matchStatus. Establish
+                        # the new baseline quietly rather than alerting on what
+                        # is only a format change.
+                        print("Baseline migrated from the fixture-list signal to the "
+                              "availability signal -- not comparable with the old "
+                              "hash, so re-establishing quietly.")
+                    elif current_hash != last_hash:
+                        print("Change detected -- sending Telegram alert...")
+                        # The source marker goes LAST. Two runners now alert on
+                        # the same fixtures so you need to know which one spoke,
+                        # but not at the cost of pushing the actionable line out
+                        # of a lock-screen preview.
+                        delivered = send_telegram(
+                            f"{describe_change(last_matches, matches)}\n\n"
+                            f"{TZK_URL}\n\n"
+                            f"-- local {POLL_SECONDS}s watcher on {HOSTNAME}"
+                        )
+                    else:
+                        print("No change.")
+
+                    # Only advance the baseline once the alert is actually out.
+                    # Saving after a failed send makes the next poll report no
+                    # change, and the alert is lost for good.
+                    if delivered:
+                        save_state({
+                            "hash": current_hash,
+                            "matches": matches,
+                            "consecutive_failures": 0,
+                        })
+                    else:
+                        print("Alert undelivered -- baseline kept so the next "
+                              "poll retries.")
+
+                    if failure_alerted:
+                        minutes = consecutive_failures * POLL_SECONDS // 60
+                        send_telegram(
+                            f"✅ Local watcher recovered after "
+                            f"{consecutive_failures} failed poll(s) "
+                            f"(~{minutes} min) on {HOSTNAME}."
+                        )
+                    elif consecutive_failures:
+                        print(f"Recovered after {consecutive_failures} failed poll(s).")
+                    consecutive_failures = 0
+                    alert_due_at = None
+                    failure_alerted = False
+
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    consecutive_failures += 1
+                    minutes = consecutive_failures * POLL_SECONDS // 60
+                    print(f"Poll failed ({consecutive_failures} in a row, "
+                          f"~{minutes} min): {e!r}")
+
+                    # Throw the browser away on EVERY failure.
+                    #
+                    # The old loop caught the exception, printed it, slept,
+                    # then called fetch_al_ahly_matches(page) again with the
+                    # SAME page object. If what broke was the browser itself
+                    # -- the Chromium process died, the context was closed,
+                    # the driver pipe went -- that page is dead for good and
+                    # every later poll raises the identical error, forever.
+                    # The loop keeps running, keeps printing, and never
+                    # scrapes again: a silent wedge, which is precisely what
+                    # rule 1 exists to make impossible.
+                    #
+                    # Relaunching unconditionally costs a ~1s restart after a
+                    # transient network blip. In exchange the wedge cannot
+                    # happen at all, and there is no need to guess which
+                    # exception types mean "the browser is gone" -- a guess
+                    # that would eventually be wrong on some Playwright
+                    # version, silently, in the direction of staying wedged.
+                    close_quietly(context, browser)
+                    browser = context = page = None
+
+                    alert_due_at, failure_alerted = maybe_alert_failure(
+                        poll, consecutive_failures, alert_due_at,
+                        failure_alerted, repr(e),
                     )
                 else:
-                    print("No change.")
+                    if polls_on_browser >= BROWSER_RECYCLE_POLLS:
+                        print(f"Recycling Chromium after {polls_on_browser} polls.")
+                        close_quietly(context, browser)
+                        browser = context = page = None
 
-                # Only advance the baseline once the alert is actually out.
-                # Saving after a failed send makes the next poll report no
-                # change, and the alert is lost for good.
-                if delivered:
-                    save_state({
-                        "hash": current_hash,
-                        "matches": matches,
-                        "consecutive_failures": 0,
-                    })
-                else:
-                    print("Alert undelivered -- baseline kept so the next "
-                          "poll retries.")
+                if HEARTBEAT_HOURS > 0 and (
+                    time.time() - last_heartbeat >= HEARTBEAT_HOURS * 3600
+                ):
+                    last_heartbeat = time.time()
+                    tracked = len(load_state().get("matches", []))
+                    send_telegram(
+                        f"💚 Local watcher alive on {HOSTNAME}: {poll} polls, "
+                        f"{tracked} Al Ahly fixture(s) tracked."
+                    )
 
-            except Exception as e:
-                print("Check failed (will retry):", e)
+                time.sleep(POLL_SECONDS)
 
-            time.sleep(POLL_SECONDS)
+        except KeyboardInterrupt:
+            print("Stopped by keyboard interrupt.")
+        finally:
+            close_quietly(context, browser)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

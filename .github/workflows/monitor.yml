@@ -2,7 +2,16 @@ name: Al Ahly Tazkarti Monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 minutes -- GitHub often runs it late when busy
+    # */5 is the FLOOR, not a tuning choice: GitHub rejects intervals shorter
+    # than 5 minutes, and rule 12 sets the same limit for the site's sake.
+    #
+    # Do not expect this to behave like a 5-minute signal. Scheduled runs are
+    # best-effort and GitHub delays or drops them under load -- observed gaps
+    # at */10 were 8-45 minutes, and the drift is the problem, not the
+    # interval. The fast signal is the 30s LOCAL runner; this job is the
+    # backstop that keeps you at a ~10-minute worst case when the laptop is
+    # asleep. Costs ~288 state commits/day instead of ~144.
+    - cron: "*/5 * * * *"
   workflow_dispatch:          # manual "Run workflow" button, for testing
 
 permissions:

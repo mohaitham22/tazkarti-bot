@@ -3,24 +3,26 @@
 ## TL;DR
 A personal ticket-availability watcher. Polls Tazkarti's public match listing with headless
 Playwright, detects when the Al Ahly fixture list changes, and pushes a Telegram message.
-A separate local-only helper pre-fills the checkout form up to — but never past — the point
-where a human must take over.
+A separate local-only helper opens a visible browser that remembers your login and types your
+credentials into the login form — then stops. You click Sign in and solve the CAPTCHA yourself.
 
 Stack: Python 3.12 + Playwright (Chromium) + Telegram Bot API + GitHub Actions (cron).
 No server, no database, no web UI. State is a single JSON file committed back to the repo.
 
-**Phases 0, 1 and 2 are DONE. The monitor reads the entire listing and now alerts on
+**Phases 0, 1, 2 and 4 are DONE. The monitor reads the entire listing and now alerts on
 `matchStatus` — "tickets are buyable" — rather than on the fixture list changing. It currently
-tracks `ZED FC vs Al Ahly FC` (matchStatus 1, AVAILABLE). There is no blocking bug in the
-monitor. The one thing not yet proven is a Phase 2 alert actually arriving in Telegram; see
-Not Yet Verified.**
+tracks `ZED FC vs Al Ahly FC` (matchStatus 1, AVAILABLE), and runs twice over: a 30-second
+local loop for latency and a `*/5` CI job as the backstop. There is no blocking bug. A
+Phase 2 alert has been delivered to Telegram for real; the outstanding Phase 4 item is reboot
+recovery, which needs an actual reboot.**
 
-**Phase 3 started 2026-08-25 and immediately hit a wall: Tazkarti's login is behind an
-invisible reCAPTCHA v2 whose token is a REQUIRED field of the login API call. Automating the
-login step is therefore off the table — not "hard", impossible without solving a CAPTCHA,
-which rule 11 forbids. The proposed replacement is a persistent browser profile you log into
-by hand once. AWAITING THE USER'S CONFIRMATION before any code is written; see the Phase 3
-blocker in Standing Blockers.**
+**Phase 3 is DONE, at a deliberately reduced scope agreed 2026-08-25. Tazkarti's login is
+behind an invisible reCAPTCHA v2 whose token is a REQUIRED field of the login API call, so
+automating login is impossible without solving a CAPTCHA, which rule 11 forbids. Rather than
+chase it, the helper was cut down to one job: open a visible browser on a PERSISTENT profile
+that remembers the session, and type the credentials in. The human clicks Sign in and solves
+the CAPTCHA. Seat/quantity/add-to-cart automation was DELETED, not deferred — see the v2 table
+for why it is low-value, and do not re-add it.**
 
 Repo: `mohaitham22/tazkarti-bot` — **PUBLIC**. Every rule about secrets in this file follows
 from that one fact.
@@ -35,19 +37,49 @@ Phase 0  ✅ DONE         Local monitor: Playwright scrape + hash diff + Telegra
 Phase 1  ✅ DONE         GitHub Actions migration so the monitor runs without a terminal open.
                          All four acceptance criteria proven. Runs #10/#11/#12, 2026-08-24.
 Phase 2  ✅ DONE         Signal is now each fixture's raw matchStatus, not the fixture list.
-                         Verified against the live site 2026-08-25. Telegram delivery of a
-                         Phase 2 alert is the one thing still unproven.
-Phase 3  🚧 BLOCKED      Pre-fill helper. Login selectors FOUND and confirmed, but the login
-                         step cannot be automated — invisible reCAPTCHA v2 gates it. Rescope
-                         to an already-logged-in browser profile. Not yet agreed; no code
-                         written.
+                         Verified against the live site 2026-08-25, and a Phase 2 alert has
+                         since been delivered to Telegram from the local runner.
+Phase 3  ✅ DONE (cut)   Login pre-fill helper, rescoped. Persistent browser profile keeps the
+                         session; the script fills the two login fields and stops. It never
+                         submits — invisible reCAPTCHA v2 makes that impossible, so the human
+                         clicks Sign in. Seat/quantity/cart code DELETED, not deferred.
+                         Verified live 2026-08-25 for LOGGED OUT and SESSION EXPIRED; the
+                         LOGGED IN path needs a human CAPTCHA solve and is unproven.
+Phase 4  ✅ DONE         Always-on local runner. alahly_ticket_monitor.py now runs under
+                         Windows Task Scheduler at 30s, with its own state file, browser-crash
+                         recovery, sustained-failure alerting and a rotating log. Verified
+                         2026-08-25. Reboot recovery is the one unobserved criterion.
 ```
 
-**Phase 2 landed the availability signal AND handed Phase 3 what it was waiting for: the feed
-carries a stable `matchId` per fixture (Al Ahly's current one is 2559), which is the per-match
-identifier Phase 3 needs. `TZK_MATCH_URL` can be derived from it instead of being pasted by
-hand — but the URL shape has NOT been confirmed yet, so confirm it against the live site before
-building on it.**
+**Why Phase 4 exists, and why it outranks Phase 3.** Tazkarti runs a virtual queue for
+high-demand matches, and **queue position is assigned by arrival time**. That makes alert
+latency the only variable worth optimising: a pre-filled form does not move you up a queue,
+arriving 40 minutes earlier does. Observed GitHub cron drift is 8–45 minutes, which is the
+entire drop window — so the CI job cannot be the fast signal no matter how it is tuned.
+
+**The two runners are a division of labour, not redundancy. Keep both.**
+
+| | GitHub Actions, `*/5` requested | Local loop, 30s |
+|---|---|---|
+| Job | Slow signal: "a match opened for booking" | Fast signal: the actual drop |
+| Drift tolerance | Hours of slack, drift irrelevant | Seconds matter |
+| Hardware | None | One always-on machine |
+| Fails when | Rarely; it is the backstop | The machine sleeps, travels, or loses power |
+
+The CI job is what makes the local runner's failure survivable: if the laptop is asleep you
+degrade to the CI signal, you do not go blind. That is the entire reason not to delete
+it once the local runner is up.
+
+**A PER-MATCH URL DOES NOT EXIST. Confirmed live 2026-08-25 — do not go looking for it again.**
+Earlier versions of this file speculated that `TZK_MATCH_URL` could be derived from the feed's
+`matchId` (Al Ahly's is 2559). It cannot. The route table in the bundle has no `matches/:id`;
+match cards contain **zero anchors**; "Book Ticket" is a `<button>` with no href that opens a
+modal (`#book-ticket-modal`) on the listing itself, and the app returns to `/matches` when done.
+Clicking it while logged out navigates to `#/login`, not to any match page. So
+`https://www.tazkarti.com/#/matches` is the best link that exists, which is what the Telegram
+alert already sends and what `TZK_MATCH_URL` correctly defaults to. (`detail/:id` in the bundle
+is Angular's own `HeroDetailComponent` tutorial boilerplate inside an error string, not a
+Tazkarti route — it is a trap, not a lead.)
 **Phase 3 is LOCAL ONLY and never runs in CI. See Coding Rules.**
 **Phase 3 step 1 is DONE — the login selectors are real and verified. Steps 2–4 (submit login,
 navigate to the match, add to cart) are all downstream of a login that cannot be automated, so
@@ -104,11 +136,13 @@ three, so it could not previously have served as a reference for any of them.
 | `alahly_ticket_check.py` | ✅ Verified locally, CI run pending | Source of truth for the shared block. Parses the FULL listing, reads raw `matchStatus`, detects availability change, alerts, fails loudly, preserves the baseline on failure, recovers. |
 | `alahly_ticket_monitor.py` | ✅ Trustworthy reference | Local loop, `POLL_SECONDS = 30`. Shared block copied by `sync_shared_block.py` and SHA-verified identical. Four consecutive polls verified locally. |
 | `sync_shared_block.py` | ✅ New, working | Enforces rule 13 mechanically. `python sync_shared_block.py` copies the block from the check script into the monitor; `--check` verifies and exits 1 on drift. Run `--check` before committing. |
-| `alahly_ticket_prefill.py` | 🚧 Skeleton, UNCHANGED this session | Still every selector a `TODO`; still never run for real. The three LOGIN selectors are now known (see Feature Specs → Phase 3) but were deliberately NOT written in, because the reCAPTCHA finding means the login block gets deleted rather than fixed. The seat-category / quantity / add-to-cart selectors remain fabricated and unverified. |
+| `alahly_ticket_prefill.py` | ✅ Rewritten and RUN for real | Login pre-fill only, and that is the finished scope. `launch_persistent_context` on a profile outside the repo; real `name`-based selectors; reports LOGGED IN / SESSION EXPIRED / LOGGED OUT; fills both fields and verifies the round-trip; **never submits**. Credentials read lazily, so the logged-in case needs none. No fabricated selectors and no TODOs remain. Carries its own RUNBOOK. |
 | `get_telegram_chat_id.py` | ✅ Working | One-shot helper, purpose served. |
-| `.github/workflows/monitor.yml` | ✅ Working | `cron: */10`, `contents: write`, `checkout@v5` / `setup-python@v6`, Playwright cache, artifact upload on failure, concurrency group. Node 20 warning gone. |
+| `.github/workflows/monitor.yml` | ✅ Working | `cron: */5` (the floor GitHub allows), `contents: write`, `checkout@v5` / `setup-python@v6`, Playwright cache, artifact upload on failure, concurrency group. Node 20 warning gone. |
 | `last_seen.json` | ✅ Migrated to v3 | `{hash: a086020c...66c5, matches: [{match_id: 2559, fixture: "ZED FC vs Al Ahly FC", status: 1, ...}]}`. `matches` is now a list of OBJECTS, not strings, and the hash covers `matchStatus`. Not comparable with any pre-2026-08-25 hash. |
 | `env.example` | ✅ Exists | Docstrings say `.env.example`; the repo file is `env.example`. Harmless. |
+| `install_local_monitor_task.ps1` | ✅ New, working | Registers the always-on Task Scheduler job. Idempotent — re-run it to apply changes. Header documents the Task Scheduler vs NSSM decision. |
+| `%LOCALAPPDATA%\tazkarti-monitor\` | ✅ New | The local runner's private working dir, **outside the repo and outside OneDrive**: `last_seen_local.json`, `monitor.log` (+5 rotations), `debug/`, `last-start-ping`, and since Phase 3 `browser-profile/` — the prefill helper's Chromium profile, which holds a **live session token**. Same OneDrive reasoning as the state file, only more so: a Chromium profile is large and rewritten constantly. |
 
 ### Verified working — with run numbers, 2026-08-24
 
@@ -128,18 +162,44 @@ three, so it could not previously have served as a reference for any of them.
 
 ### Not yet verified
 
-- **A Phase 2 alert actually arriving in Telegram.** `describe_change()` is unit-tested for
-  every transition and `send_telegram()` is unchanged and previously proven, but no Phase 2
-  message has been delivered end-to-end. Test it the documented way: edit `last_seen.json`,
-  change the tracked fixture's `status` from `1` to `4`, and run the script — it should send
-  `🎫 TICKETS ON SALE: ZED FC vs Al Ahly FC (COMING_SOON -> AVAILABLE)`.
-- **Phase 2 running in CI at all.** Everything so far is local. The first scheduled run after
-  this commit is the real test.
+- ~~**A Phase 2 alert actually arriving in Telegram.**~~ **RESOLVED 2026-08-25.** Delivered
+  from the local runner: `Change detected -- sending Telegram alert...` / `Telegram alert sent
+  OK.` at 22:25:37, by doctoring the tracked fixture's `status` to `4` in
+  `last_seen_local.json`. Doing this is now risk-free — the local and CI baselines are separate
+  files, so the test cannot disturb the CI baseline the way it would have before.
+- **Reboot recovery of the local runner.** The At-log-on trigger is registered and the
+  1-minute watchdog is proven to start the task from cold, but **no reboot has been
+  performed** — deliberately, it is not mine to trigger on a machine that is currently
+  watching. Verify it: reboot, log in, wait ~2 minutes, expect a `✅ Local Tazkarti watcher
+  started` Telegram message.
+- ~~**Phase 2 running in CI at all.**~~ **RESOLVED 2026-08-25.** It has been running unattended
+  for hours. `origin/main`'s `last_seen.json` is v3 with object entries, `hash a086020c641a`,
+  `consecutive_failures: 0`, `last_error: null`, tracking
+  `{match_id: 2559, fixture: "ZED FC vs Al Ahly FC", status: 1, status_label: "AVAILABLE"}`.
+  **The hash independently matches the value the local runner computed** — two different
+  machines, two different code paths, same 64 hex characters, which is far stronger evidence
+  than a green job. Note the local clone can be many commits behind: `git fetch` before
+  concluding anything about CI from `git log`. A quiet local `git log` is not a quiet CI.
 - **matchStatus values 2, 3 and 4 in the wild.** Every fixture on the site has been `1` the
   whole time. The vocabulary is not guesswork — it was read out of Tazkarti's own compiled
   template and i18n files (see Feature Specs) — but no transition has ever been *observed*.
   This is why the hash covers the raw integer: an unrecognised value still moves it.
-- Prefill helper, in any form.
+- **The `*/5` schedule actually running in CI.** The cron was changed 2026-08-25 but no
+  scheduled run has happened on it yet. Confirm from the Actions tab that runs are arriving as
+  `event: schedule`, and note the REAL gaps between them — if they still cluster at 8–45
+  minutes, that is the drift blocker, not a broken schedule, and nothing is wrong with the
+  config. Also worth one glance: `FAILURE_REALERT_EVERY = 12` has never fired at the new cadence.
+- **Being signed in on the PHONE.** Nothing in this repo can do this and nothing tests it. The
+  alert links to `#/matches`, and Book Ticket there goes to `#/login` if that browser has no
+  session — verified live. Sign in once in your phone's browser so a drop alert is one tap.
+  This is the single highest-value manual step left, and it is worth more than any code here.
+- **The prefill helper's LOGGED IN path.** `LOGGED OUT` and `SESSION EXPIRED` were both verified
+  against the live site 2026-08-25. `LOGGED IN` cannot be reached without a real sign-in, which
+  needs a human CAPTCHA solve, so it has never executed. Verify it by running
+  `python alahly_ticket_prefill.py`, signing in for real, pressing Enter, then running it a
+  second time: expect `Status:  LOGGED IN` and `Already signed in as <your name>`. **Until that
+  is done, "the session persists across runs" is proven for a planted token but not for a real
+  one.**
 
 ### Standing Blockers
 
@@ -163,18 +223,29 @@ three, so it could not previously have served as a reference for any of them.
   fix, and GitHub can retain unreachable blobs anyway. Never treat anything in `.env` as
   having been private.
 - **Every run commits `last_seen.json`** — `updated_at` changes even when nothing else does,
-  so the state commit lands on every run rather than only on change. Side effect: ~144 bot
-  commits/day at `*/10`. Upside: it keeps the repo active, which defuses the 60-day
+  so the state commit lands on every run rather than only on change. Side effect: ~288 bot
+  commits/day at `*/5` (was ~144 at `*/10`). Upside: it keeps the repo active, which defuses the 60-day
   scheduled-workflow shutoff below. Fix, if it ever annoys: only write when `hash` or
   `consecutive_failures` changes.
 - **Scheduled workflows are disabled after 60 days of repository inactivity.** Currently
   defused by the commit-every-run behaviour above. If that is ever "fixed", this comes back.
-- **GitHub cron drift** — `*/10` is a request, not a promise. Observed gaps of 8–45 minutes.
-- **Prefill selectors are fabricated** — PARTIALLY RESOLVED 2026-08-25. `#username`,
-  `#password` and `#login-button` are replaced by real, verified selectors (see Feature Specs
-  → Phase 3), though they are recorded there rather than written into the script. The other
-  three — `#seat-category`, `#quantity`, `#add-to-cart` — were invented and are still
-  unverified, because reaching the page that has them requires a logged-in session.
+- **GitHub cron drift** — `*/5` is a request, not a promise. Scheduled runs are best-effort and
+  GitHub delays or skips them under load. The interval is the floor, the drift is the ceiling,
+  and the drift is why the local 30s runner exists. Do not read `*/5` as "a 5-minute signal".
+  **Measured 2026-08-25 from the state-commit timestamps on `origin/main`, at `*/10`:**
+
+  ```
+  17:45 -> 18:16 -> 19:03 -> 19:42 -> 20:05
+   gaps:   31min    47min    39min    23min
+  ```
+
+  That is GitHub already ignoring a 10-minute request by 3-5x. It is the single clearest
+  argument for why the local runner is not redundant, and for why tightening the cron is close
+  to cosmetic. `git log origin/main --format="%ad %s" --date=format:"%H:%M"` regenerates this.
+- ~~**Prefill selectors are fabricated**~~ — RESOLVED 2026-08-25. The three login selectors are
+  real, verified live, and now written into the script. The other three — `#seat-category`,
+  `#quantity`, `#add-to-cart` — were **deleted along with the code that used them**, so there
+  are no fabricated selectors left in the repo. See the v2 table before rebuilding them.
 - **🚧 PHASE 3 BLOCKER: Tazkarti's login cannot be automated — invisible reCAPTCHA v2.**
   *Symptom:* the login form at `#/login` renders `<re-captcha size="invisible"
   id="ngrecaptcha-0">` (sitekey `6LcgZfUsAAAAAAji0eMKvFPicrHdkNbPQ9gneFJo`) between the
@@ -185,14 +256,46 @@ three, so it could not previously have served as a reference for any of them.
   submit. Login only fires from reCAPTCHA's own callback:
   `resolved: function(e,n){ this.recaptchaResponse=e, e ? (this.submitted=!0, this.submitLogin(n)...`
   So there is NO code path to a session without a Google-issued token.
-  *Fix path:* do not chase it. Solving or bypassing it is forbidden by rule 11 and by the
-  prefill docstring's stated boundary, and relying on the invisible challenge silently passing
-  a headless browser's risk score is the kind of thing that works in testing and fails on the
-  morning tickets actually drop. Rescope to `launch_persistent_context()` with a dedicated
-  user-data dir: the human signs in once by hand in that window — CAPTCHA and any OTP included
-  — the session cookie persists in the profile, and the helper reuses it and skips login
-  entirely. It must detect a stale session and stop with "log in again" rather than silently
-  prefilling nothing. **Not yet agreed with the user; no code written.**
+  *Fix path — AGREED AND IMPLEMENTED 2026-08-25, so this is now a documented constraint rather
+  than an open blocker.* Do not chase the CAPTCHA. Solving or bypassing it is forbidden by rule
+  11, and relying on the invisible challenge silently passing a headless browser's risk score is
+  the kind of thing that works in testing and fails on the morning tickets actually drop. The
+  helper now uses `launch_persistent_context()` with a dedicated user-data dir: the human signs
+  in by hand in that window — CAPTCHA and any OTP included — the session persists in the
+  profile as `localStorage["ETMS-Token"]`, and later runs reuse it and skip login entirely.
+  **The script never submits the login form, by design.** Anything that would change that is
+  out of bounds.
+- **⚠️ THE ALWAYS-ON MACHINE IS A LAPTOP. This is the local runner's real failure mode.**
+  `Mohamed` is a Dell G15 5511 — chassis type 10, `PCSystemType 2`, i.e. a notebook with a
+  battery. Measured 2026-08-25, it behaves like a desktop *in its current configuration*:
+  wired Ethernet, on AC, **sleep-after on AC = Never**, hibernate on AC = Never, 8 days of
+  uptime, and the Kernel-Power log shows only 2–11 **second** sleep blips over 14 days — no
+  overnight sleeps at all. But the configuration is the only thing holding that up:
+  - **On battery, sleep-after is 5 minutes** (`DC index 0x12c`). Unplug it and the 30s watcher
+    is gone within five minutes of going idle.
+  - Its only sleep state is **S0 Low Power Idle (Modern Standby)**, which throttles desktop
+    processes rather than announcing a clean suspend.
+  - The task runs as the logged-on user, so it also stops if you sign out.
+  A sleeping 30-second poller is **worse than the CI job**, because it looks healthy
+  while delivering nothing. Two things exist specifically to stop that becoming false
+  confidence: the **daily heartbeat** (`TZK_HEARTBEAT_HOURS`, absence is the symptom) and
+  **keeping the CI job**, which degrades you to a slow-but-real signal instead of to zero. If this
+  machine starts travelling, move the runner to a Raspberry Pi or a cheap always-on box —
+  running this same local script there is much simpler than a self-hosted Actions runner.
+- **The local runner restarts on a ~60s watchdog, so restart latency is not zero.** A crash
+  costs up to a minute of blindness, plus a few seconds of Chromium start-up. Acceptable
+  against 8–45 minutes of cron drift, but it is not "instant" and should not be described that
+  way.
+- **A start-up Telegram ping is rate-limited to one per 10 minutes.** If the script ever
+  crash-loops you get ONE message, not sixty an hour. The trade-off is that a genuine restart
+  within 10 minutes of a previous one is silent — the log line
+  `Skipping the start-up ping` is where that is recorded.
+- ~~**`load_state()` swallowed every read error**~~ — FIXED 2026-08-25. It used to `return {}`
+  on any exception, which callers cannot distinguish from "no baseline yet", so a corrupt file
+  silently re-established the baseline and threw away the alert about to fire. It now warns,
+  preserves the file as `.corrupt`, and reads `utf-8-sig` so a BOM is not fatal. `save_state()`
+  writes to a temp file and `os.replace()`s it, so a crash mid-write cannot truncate the
+  baseline — which matters much more now that something rewrites it 2,880 times a day.
 - **Login may also be behind an OTP — UNKNOWN, not ruled out.** `main.57e770ff8543ee8f6d96.js`
   contains `id="btn_sendOTP"`, itself also gated behind `recaptchaRef.execute()`. Whether the
   *login* flow triggers it cannot be determined without submitting the form, and submitting is
@@ -236,7 +339,10 @@ lesson of Phase 1.**
 | 2026-08-24 | 1 → ✅ | Verified all three failure paths in CI (runs #10/#11/#12). Found + fixed a silent Telegram delivery failure. Rotated leaked credentials. Found the page-1 pagination bug. | Scraper reads 6 of 10 matches and is missing live `ZED FC vs Al Ahly FC`. | Decide the `View More` fix, then apply it to BOTH scripts in one commit. |
 | 2026-08-25 | 1 → 2 | Fixed pagination in both scripts (`8178263`); scraper reads all 10 fixtures and now tracks `ZED FC vs Al Ahly FC`. Real alert delivered, run #44. Aligned the local monitor with the CI script. Fixed a truncated `TZK_URL` in `.env`. | None blocking. | Phase 2: read `.status` per match, alert on availability rather than on fixture-list changes. |
 | 2026-08-25 | 2 → ✅ | Phase 2 built. Signal is now the raw `matchStatus` from the page's own JSON feed, not `.team-names`. Structured state (v3), transition-aware alert wording, DOM/feed cross-check. Fixed two bugs found by testing: `NBE Club` tracked as Al Ahly, and the SPA never reloading between polls. Added `sync_shared_block.py` to enforce rule 13 mechanically. | Phase 2 alert not yet delivered to Telegram; not yet run in CI. | Force one alert to prove delivery, watch the first scheduled CI run, then Phase 3. |
+| 2026-08-25 | 4 ✅ | Promoted the local monitor to an always-on 30s runner under Task Scheduler. Separate state file, browser-crash recovery, sustained-failure alerting, rotating log, atomic + loud state I/O. Delivered the first-ever Phase 2 alert to Telegram. | Machine is a laptop — always-on only while on AC + Ethernet. Reboot recovery not observed. | Reboot once, confirm the `✅ started` ping arrives. Then Phase 3's scope decision. |
 | 2026-08-25 | 3 🚧 | Phase 3 step 1 only. Dumped the real login DOM and replaced three of the six fabricated selectors with verified ones (`input[name="txtFanId"]`, `input[name="txtPassword"]`, `form button.button-green`). Ran a visible fill with no submit — both fields round-tripped. Then STOPPED: login is gated by an invisible reCAPTCHA v2 that is a required field of the login API. No project code changed. | Login cannot be automated (reCAPTCHA v2, required token). OTP after login unknown. `TZK_MATCH_URL` still points at the listing, not a match page. | Get the user's decision on the persistent-profile rescope. If yes, rewrite the prefill helper around `launch_persistent_context()` and delete the login block, then confirm the per-match URL shape from `matchId` 2559. |
+| 2026-08-25 | 3 ✅ / CI | Chased the per-match URL to a definitive NEGATIVE: it does not exist, so the alert's existing link is already optimal. Cut CI cron `*/10` → `*/5` (GitHub's floor) and doubled `FAILURE_REALERT_EVERY` 6 → 12 to keep failure nudges hourly. | `*/5` does not mean a 5-minute signal — drift is unchanged. State commits now ~288/day. | Sign in once for real to prove the prefill LOGGED IN path; sign in on the PHONE so the alert link is one tap; reboot for the Phase 4 criterion. |
+| 2026-08-25 | 3 ✅ | Rescope AGREED and built. `alahly_ticket_prefill.py` rewritten: persistent profile, login pre-fill only, never submits. Deleted seat/quantity/add-to-cart entirely. Re-verified the login selectors live. Found that the session token is **localStorage**, so the profile really does persist a login. Ran it for real — LOGGED OUT and SESSION EXPIRED both verified against the live site. | LOGGED IN path unproven (needs a human CAPTCHA solve). `TZK_MATCH_URL` still the listing, not a match page. | Sign in once for real to prove the LOGGED IN path and confirm the session survives a restart. Then reboot the machine for the outstanding Phase 4 criterion. |
 
 ### Session Notes (Full Detail)
 
@@ -258,7 +364,7 @@ lesson of Phase 1.**
   `wait_for_selector` instead of `networkidle` + fixed sleep, screenshot + HTML dump to
   `debug/` on failure, real User-Agent with `ar-EG` locale and `Africa/Cairo` timezone,
   Arabic normalisation (أ/إ/آ → ا, ى → ي, strip diacritics), `sorted()` before hashing,
-  baseline preserved on failure, hourly re-alert instead of every-10-minute spam.
+  baseline preserved on failure, hourly re-alert instead of every-run spam.
 - Rewrote `monitor.yml`: pinned `checkout@v5` / `setup-python@v6`, cached
   `~/.cache/ms-playwright`, `upload-artifact` on failure, `concurrency` group,
   `git pull --rebase --autostash` before push.
@@ -547,6 +653,233 @@ raw `matchStatus`. Nothing in Phase 3 reads or writes it, and no scraping logic 
 *Next session must start by getting a decision, not by writing code.* The rescope to a persistent
 browser profile is a proposal the user has not yet accepted.
 
+**Session 2026-08-25 (fourth) — Phase 4, the always-on local runner**
+
+*The reframing that drove it.* Tazkarti assigns virtual-queue position by **arrival time**. So
+alert latency is the only variable worth optimising — a pre-filled form does not move you up a
+queue, arriving 40 minutes earlier does. Cron drift of 8–45 minutes is the whole drop window,
+which means the CI job structurally cannot be the fast signal. Hence a 30s local runner, with
+CI kept as the slow backstop. This also demotes Phase 3 (prefill) from "the next thing" to
+"a nice-to-have", which is worth remembering the next time the reCAPTCHA blocker feels urgent.
+
+*Rule 13 was already satisfied and stayed that way.* `sync_shared_block.py --check` was clean
+at the start (501 lines, `155cbaf83039`). Every shared-block change this session was made in
+`alahly_ticket_check.py` and synced across; the block ended at 552 lines, `47dca6502a4e`.
+Nothing was hand-copied.
+
+*Two paths in the shared block became absolute.* `STATE_FILE` and `DEBUG_DIR` were bare
+relative strings. Task Scheduler sets **no working directory**, so under it a relative baseline
+would have been written to wherever the process happened to start — and a baseline the next
+run cannot find reads as "no baseline yet", which re-establishes silently and eats the alert.
+Both now resolve next to the script, and both accept a `TZK_*` override. CI is unaffected: it
+runs from the repo root, so the resolved path is the same file it always was.
+
+*The wedge that was actually there.* The old loop's `except Exception` printed, slept, and then
+called `fetch_al_ahly_matches(page)` again **with the same page object**. If the browser itself
+had died, that page was dead for good and every later poll raised the identical error, forever
+— the loop still running, still printing, never scraping again. Proven live: killing Chromium
+under a running monitor produced
+`TargetClosedError('Page.goto: Target page, context or browser has been closed')` at 22:22:30,
+then `Launched a fresh Chromium.` at 22:23:00 and a clean scrape at 22:23:03. The fix throws
+the browser away on **every** failure rather than trying to classify which exceptions mean "the
+browser is gone" — that classification is a guess that eventually goes wrong silently, and in
+the direction of staying wedged. A transient blip pays ~1s for a relaunch; the wedge becomes
+structurally impossible. Chromium is also recycled every 240 polls (~2h) so a week-long process
+cannot leak its way into slowness.
+
+*Failure alerting, tuned against notification fatigue.* Silent for the first 6 failures (3
+min), because one timeout is not news; then hourly; then a recovery message. An alert that
+could not be sent retries in ~5 min rather than an hour, since the usual cause is the same
+outage that broke the poll. Verified by forcing the threshold: `Telegram alert sent OK.`, and
+the repeat scheduled 120 polls out.
+
+*Closed the oldest open item in this file.* A Phase 2 alert has now actually been delivered:
+`Change detected -- sending Telegram alert...` / `Telegram alert sent OK.` at 22:25:37, by
+setting the tracked fixture's `status` to `4` in the LOCAL state file. Worth noting that this
+test only became safe *because* the state files were split — doing it before would have
+doctored the baseline CI commits.
+
+*A bug the test harness found by accident.* The first attempt at that test wrote the state file
+from PowerShell, which emits a UTF-8 **BOM**. Python's `json.load` threw, `load_state()`
+swallowed it and returned `{}`, and the run re-baselined and alerted nothing. That is rule 1
+wearing yet another hat: an unreadable baseline was indistinguishable from no baseline. Now it
+warns loudly, keeps the file as `.corrupt`, and reads `utf-8-sig`. And since the local runner
+rewrites this file 2,880 times a day, `save_state()` now writes to a temp file and
+`os.replace()`s it, so an unclean shutdown cannot leave a truncated baseline behind.
+
+*Task Scheduler over NSSM, and why.* Recorded in the header of
+`install_local_monitor_task.ps1`. Short version: the two things NSSM would buy — auto-restart
+and log rotation — the script now does itself, leaving NSSM's only real advantage as "starts
+before anyone logs in". That advantage is expensive here. A service runs as SYSTEM, and
+Playwright's Chromium lives in the **user** profile (`%LOCALAPPDATA%\ms-playwright`, confirmed:
+`chromium-1223/1234`), so SYSTEM cannot find it without extra path plumbing; and running the
+service as this account means storing a password for what is a **MicrosoftAccount**
+(`PrincipalSource : MicrosoftAccount`), which is worse. So: run as the logged-on user, no
+stored password, `LogonType Interactive`.
+
+*Two triggers.* At-log-on is what brings it back after a reboot. A second trigger repeats
+**every minute** forever with `MultipleInstances = IgnoreNew` — a no-op while the monitor is
+alive, and a restart within ~60s of it dying for any reason the script could not catch itself.
+That is the piece replacing NSSM's auto-restart. It was 5 minutes first and tightened to 1
+precisely because a restart gap *is* alert latency. Measured: 82s at 5-minute spacing, 20s at
+1-minute spacing, and from a cold `Ready` state the watchdog started the task by itself in 10s
+with no manual start at all. Restarts reload the existing baseline — `No change.`, not a
+re-baseline.
+
+*`pythonw.exe`, not `python.exe`.* The task runs in the interactive session, so `python.exe`
+would flash a console window at every logon and every watchdog restart. The cost is that a
+failure *before* `install_logging()` runs — an import error, say — is invisible except as the
+task's `LastTaskResult` and a missing heartbeat. Everything after that first line is captured.
+
+*Logging, because there is no console.* stdout and stderr are teed into
+`%LOCALAPPDATA%\tazkarti-monitor\monitor.log`, rotating at 2 MB × 5. The tee also swallows
+console encoding errors: an Arabic team name through a cp1252 console raises
+`UnicodeEncodeError` inside the `print()` itself, down in the shared block, where there is no
+`try/except` to catch it.
+
+*The honest finding about the hardware.* See the Standing Blockers entry. Summary: this is a
+laptop that currently behaves like a desktop, and every acceptance criterion above would pass
+identically on a laptop about to be put in a bag. The heartbeat and the retained CI job are
+the mitigations; a Pi is the answer if it ever starts travelling.
+
+*Not done, deliberately.* **No reboot was performed** — it is not mine to trigger on a machine
+that is currently watching for a drop. The At-log-on trigger is registered and cold-start via
+the watchdog is proven, but reboot recovery is unobserved and is listed as such.
+
+**Session 2026-08-25 (fifth) — Phase 3 rebuilt at a smaller scope, and finished**
+
+*The decision that unblocked it.* The user cut the scope rather than fight the CAPTCHA: the
+helper does exactly one thing — open a visible browser on a persistent profile and type the
+login fields in. The human clicks Sign in. Everything downstream of a submitted login was
+**deleted**, not deferred, with the explicit reasoning that *a future session reads a `# TODO`
+as unfinished work and tries to complete it*. That instruction is why there is now not one TODO
+or fabricated selector left in the file, and why the deleted seat/quantity work is parked in the
+v2 table with the reason attached rather than as a stub in the code.
+
+*Selectors re-derived live rather than trusted from these notes.* A read-only Playwright dump of
+`#/login` confirmed all three, each resolving to exactly one element: `input[name="txtFanId"]`
+(text, maxlength 16, placeholder `12345678901234`), `input[name="txtPassword"]` (maxlength 20),
+and one visible `form button.button-green` reading `Sign in`, `type="button"`. The form still
+carries **no `id` attributes at all**, which is why the original `#username` / `#password` could
+never have matched anything — they were not merely wrong, they were structurally incapable.
+
+*The finding the whole rescope depended on, and it was not assumed.* A persistent profile only
+helps if the session lives in `localStorage` (survives a browser restart) rather than
+`sessionStorage` (does not). From the site's own bundle:
+`getToken = () => localStorage.getItem("ETMS-Token")`, and `isLoggedIn = !!getToken()`.
+`ETMS-Token` / `ETMS-RefreshToken` / `ETMS-ExpireToken` / `profileData` are all localStorage;
+only the *guest* token is sessionStorage. Then proven empirically rather than left as inference:
+a token written by one process was read back by a **separate process after a full browser
+restart**. Using the site's own `!!ETMS-Token` test also means the login check does not depend
+on reading English text out of the header, which would have broken the day the site renders in
+Arabic — the same trap rule 6 exists for.
+
+*A hole found by testing the check instead of trusting it.* The first version decided "logged
+in" by seeing whether the site bounced us to the login form. But `TZK_MATCH_URL` defaults to the
+**public** match listing, which never bounces — so a dead token would have read as LOGGED IN,
+which is this project's signature failure mode (a healthy-looking report that delivers nothing).
+The fix uses the site against itself: the header requests the cart-icon count on every page, and
+that call is authenticated, so a revoked token 401s and Tazkarti's own interceptor runs
+`clearCache()` and deletes it. The script therefore reads the token, lets the page settle, and
+reads it **again**. Verified by planting `ETMS-Token = 'planted-not-a-real-token'` in a scratch
+profile: the run correctly reported `SESSION EXPIRED`.
+
+*The residual limit is written down rather than papered over.* Every client-side signal — token,
+header, `Welcome <name>` — comes from the same localStorage, so if the site happens to make no
+authenticated call while we look, a dead token can still read as LOGGED IN. That is stated in the
+script's RUNBOOK with the human tell (the header says "Sign in" instead of your name). Detecting
+it properly would need an authenticated request of our own, which was judged not worth it for a
+human-triggered one-shot tool.
+
+*Actually run, three times, against the live site.* `LOGGED OUT` on a fresh profile: both fields
+round-tripped, `Tazkarti ID filled: True (14 chars)` / `Password filled: True (14 chars)` — the
+14 matching the ID length recorded last session. `SESSION EXPIRED` via the planted token. Both
+left the browser open and closed cleanly on Enter. **`LOGGED IN` is NOT verified** — it needs a
+real sign-in with a human CAPTCHA solve, so it is listed under Not Yet Verified rather than
+claimed.
+
+*Small things that were wrong and are now not.* Credentials are read **lazily**, inside the
+logged-out branch only — the old module-level `os.environ["TZK_USERNAME"]` would have crashed the
+*common* case (already logged in, no credentials needed) for no reason. `env.example` still
+described `TZK_USERNAME` as "your-tazkarti-username"; it is a 14–16 digit Tazkarti ID, and the
+template said so nowhere. The `Sign in` box printed in the terminal was hand-aligned and ragged,
+so it is now built by a helper that pads to the widest line.
+
+*Where the profile lives, and why not next to the script.* `%LOCALAPPDATA%\tazkarti-monitor\
+browser-profile`, overridable with `TZK_PROFILE_DIR`. Same reasoning as the local runner's state
+file but stronger: the repo is in OneDrive, and a live Chromium profile is a large, constantly
+rewritten pile of files. `browser-profile/` was also added to `.gitignore` — the default is
+outside the repo, but `TZK_PROFILE_DIR` can point anywhere, and this directory holds a **live
+session token**. Given `.env` was once committed to this public repo, the belt-and-braces guard
+is cheap.
+
+*Not done, deliberately.* `TZK_MATCH_URL` still points at the listing rather than a match page —
+the per-match URL shape derived from `matchId` 2559 remains unconfirmed, exactly as the Phase 2
+notes warned, so the script defaults to the listing and says so at runtime instead of inventing
+a URL shape. No scraping logic was touched, so rule 13 is not in play and
+`sync_shared_block.py --check` is still clean (552 lines, `47dca6502a4e`). `last_seen.json` did
+not change meaning.
+
+**Session 2026-08-25 (sixth) — the per-match URL question, closed; and the CI cron floor**
+
+*The question that started it.* "If I tap the Telegram link, does it open the match page, logged
+in?" Both halves of that turned out to be wrong assumptions, and both are now documented above so
+they do not get re-assumed.
+
+*Half one: there is no match page.* This file had speculated since Phase 2 that `TZK_MATCH_URL`
+could be derived from the feed's `matchId`. It cannot, and this is now settled by evidence rather
+than left as a lead:
+
+- The bundle's route table has `matches`, `login`, `profile`, `events`, `e/:id`, `stadium` … and
+  **no `matches/:id`**.
+- On the live listing, `.match a` returns **`[]`** — the cards contain no anchors at all. The only
+  hrefs on the page are `javascript:void(0)`.
+- `Book Ticket` is a `<button>` with no `href`. Its handler opens a **modal** on the listing
+  (`#book-ticket-modal` / `#queueModal`), and the app calls `router.navigateByUrl("/matches")`
+  when the flow ends.
+- Clicked it live: `#/matches` → **`#/login`**. Not a match page.
+
+**The trap to avoid next time:** the bundle *does* contain `path: 'detail/:id'`, which looks
+exactly like the answer. It is inside an Angular framework error string demonstrating a malformed
+route config, referencing `HeroDetailComponent` — Angular's own Tour of Heroes tutorial. It is
+boilerplate in a diagnostic message, not a Tazkarti route. Grepping route-shaped strings out of a
+bundle finds the framework's examples as readily as the app's own routes.
+
+*So the deliverable here was a negative, and the alert was left alone.* `#/matches` is the best
+link that exists. Changing it would have meant inventing a URL shape, which is precisely what the
+Phase 2 note warned against.
+
+*Half two: the persistent profile has nothing to do with the phone.* Worth stating plainly
+because it is an easy and expensive thing to assume: the profile is a Chromium user-data
+directory in `%LOCALAPPDATA%` on the monitoring machine, used only by the prefill helper. A
+Telegram link tapped on a phone opens the phone's browser with its own separate session. Combined
+with the click test above — logged out, Book Ticket goes to `#/login` — **being signed in on the
+phone is what makes the alert one tap**, and nothing in this repo can do it for you.
+
+*The cron change, and the correction it forced.* `*/10` → `*/5`. Five minutes is the floor twice
+over: GitHub rejects anything shorter, and rule 12 sets the same limit. The concern was stated
+and the user reaffirmed, so it landed — but the honest framing is in Standing Blockers: **this
+does not make CI a 5-minute signal.** Observed drift at `*/10` was 8–45 minutes, scheduled runs
+are best-effort, and halving the request does not halve the drift. The local 30s runner is still
+the only fast signal.
+
+*What the cron change silently broke, and why it was caught.* `FAILURE_REALERT_EVERY = 6` counts
+**runs**, not minutes, and its comment said "one nudge per hour at a 10-minute cadence". At `*/5`
+that becomes a nudge every 30 minutes — double the notification fatigue the failure-detection
+spec explicitly warns about. Raised to 12, with the rule written at the constant: `N = 60 /
+interval_mins`. This is the kind of coupling that survives a green job indefinitely, because
+nothing fails — you just get quietly spammed the first time the scraper breaks, months later.
+It sits at line 57, **outside** the shared block, and the local monitor has its own independent
+`FAILURE_REALERT_EVERY = 120` (~1h at 30s), so rule 13 was not in play and
+`sync_shared_block.py --check` stayed clean at 552 lines / `47dca6502a4e`.
+
+*Verified, not assumed.* `monitor.yml` re-parsed as YAML after editing (an early version of the
+edit duplicated the `workflow_dispatch` key — caught immediately, fixed). The check script was
+then run end-to-end against a **scratch state file** so the repo baseline was not disturbed:
+`Parsed 10 match cards after 1 'View More' click(s), 1 of them Al Ahly.` /
+`ZED FC vs Al Ahly FC -- AVAILABLE (matchStatus=1)` / quiet v2→v3 migration / exit 0, no alert
+sent. `git diff last_seen.json` was empty afterwards, as intended.
+
 ---
 
 ## What We Are Building
@@ -564,6 +897,10 @@ A personal notification tool for one fan watching one team. Specifically:
 Reads a public page on a timer, the same thing a browser refresh does. Touches no private API.
 Does not book, pay, or hold anything.
 
+Since Phase 4, (1) and (3) run **twice over**: a 30-second local loop for latency and a
+`*/5` CI job as the backstop. They keep separate baselines on purpose — see the State File
+Schema section.
+
 ---
 
 ## What NOT to Build
@@ -571,6 +908,8 @@ Does not book, pay, or hold anything.
 ```
 ❌ Auto-purchase / auto-click "Pay" or "Confirm"     — never, in any phase
 ❌ CAPTCHA solving or bypass                          — never
+❌ Submitting the login form / clicking "Sign in"     — never (it IS the CAPTCHA)
+❌ Seat / quantity / add-to-cart automation           — deleted 2026-08-25, see v2 table
 ❌ Running the prefill helper in CI                   — never (needs a human at the browser)
 ❌ TZK_USERNAME / TZK_PASSWORD as Actions secrets     — never (public repo, and pointless)
 ❌ Multiple accounts, proxy rotation, IP cycling      — never
@@ -594,15 +933,17 @@ line exists to stop.
 
 | | Local (`alahly_ticket_monitor.py`) | CI (`alahly_ticket_check.py`) |
 |---|---|---|
-| Loop | `while True` + `sleep(30)` | Single run, exits |
+| Loop | `while True` + `sleep(30)`, under Task Scheduler | Single run, exits |
 | Repeat driver | The script itself | GitHub Actions cron |
 | State | `last_seen.json` on disk | `last_seen.json` committed to the repo |
 | Secrets | `.env` via `python-dotenv` | Repo Actions secrets |
 | Requires terminal open | Yes | No |
 | Status | ✅ Reference implementation | ✅ Working; source of truth for the shared block |
 
-**Why both exist:** the local version is the ground truth. When the CI version misbehaves, run
-the local one to determine whether the problem is the code or the environment. Do not delete it.
+**Why both exist:** two reasons now. The local version is still the ground truth — when the CI
+version misbehaves, run the local one to find out whether the problem is the code or the
+environment. Since Phase 4 it is also **the fast signal**, the one that actually gets you into
+the virtual queue early. Do not delete either.
 
 **Keep the scraping logic identical between them.** If a selector or normalisation rule changes
 in one, change it in the other in the same commit. A divergence here destroys the whole point of
@@ -611,7 +952,7 @@ having a reference implementation.
 ### Flow
 
 ```
-GitHub Actions cron (*/10)
+GitHub Actions cron (*/5)
   └─> checkout repo (brings last_seen.json)
       └─> headless Chromium -> about:blank -> tazkarti.com/#/matches
           │   (capturing the page's own /data/matches-list-json.json response)
@@ -641,12 +982,13 @@ with `GITHUB_TOKEN` do not re-trigger workflows, so there is no infinite loop.
 tazkarti-bot/
 ├── .github/
 │   └── workflows/
-│       └── monitor.yml              ✅ cron */10 + workflow_dispatch
+│       └── monitor.yml              ✅ cron */5 + workflow_dispatch
 ├── .vscode/                         ✅ editor config
 ├── alahly_ticket_check.py           ✅ CI single-run — SOURCE OF TRUTH for the shared block
 ├── alahly_ticket_monitor.py         ✅ local loop — reference implementation
-├── alahly_ticket_prefill.py         ⬜ local helper — all selectors TODO
+├── alahly_ticket_prefill.py         ✅ local helper — login pre-fill ONLY, never submits
 ├── sync_shared_block.py             ✅ copies + verifies the shared block (rule 13)
+├── install_local_monitor_task.ps1   ✅ registers the always-on Task Scheduler job
 ├── get_telegram_chat_id.py          ✅ one-shot setup helper
 ├── last_seen.json                   ✅ committed state — v3, hashes raw matchStatus
 ├── env.example                      ✅ template
@@ -681,6 +1023,25 @@ tazkarti-bot/
 
 Superseded: **v1** `{"hash": ...}`; **v2** the same shape as v3 but with `matches` as a list of
 plain fixture STRINGS and a hash covering only those names.
+
+**There are now TWO state files with this schema, and they must never be pointed at each other:**
+
+| File | Owner | Why separate |
+|---|---|---|
+| `last_seen.json` (repo root) | `alahly_ticket_check.py` in CI | Committed on every run |
+| `%LOCALAPPDATA%\tazkarti-monitor\last_seen_local.json` | `alahly_ticket_monitor.py` | See below |
+
+Sharing one file makes each runner's write look like a change to the other, so the two
+cross-fire false alerts at each other indefinitely. The local copy is also kept out of the repo
+because the repo lives in OneDrive — a 30-second loop rewriting a file there is ~2,880 uploads
+a day, and a sync lock landing on the one write that mattered loses a baseline. Both paths are
+now overridable with `TZK_STATE_FILE`, and both default to a path resolved **next to the
+script**, not to the working directory, because Task Scheduler does not set one.
+
+Note the repo copy is still **v2** as committed (`8fbc6677...`, `matches` as strings) — the
+Phase 2 commit landed after the last CI state commit, so the next CI run migrates it quietly.
+The `a086020c...66c5` hash recorded in the Current State table is the v3 value, and it was
+independently reproduced by the local runner on 2026-08-25.
 
 Rules:
 - **`matches` is a list of objects, not strings.** A v2 state is detected (`any(isinstance(m,
@@ -730,14 +1091,24 @@ TELEGRAM_CHAT_ID=<from get_telegram_chat_id.py>
 # ── Prefill helper (LOCAL .env ONLY — NEVER in GitHub secrets) ───
 # NOTE: TZK_USERNAME is NOT an email. The login field is "Tazkarti ID *"
 # (input[name="txtFanId"], maxlength 16, placeholder 12345678901234) and wants
-# a 14-16 digit numeric ID. The value currently in .env is a correct 14-digit
-# one; only the prefill docstring's description of it was wrong.
-# BOTH of these become unnecessary if the persistent-profile rescope is agreed.
+# a 14-16 digit numeric ID. The value currently in .env is a correct 14-digit one.
+# Both are read LAZILY -- only when you are actually logged out. Once the
+# profile holds a session, the helper never touches them.
 TZK_USERNAME=<your 14-16 digit Tazkarti ID>
 TZK_PASSWORD=<your Tazkarti account password>
-TZK_MATCH_URL=<specific match page, filled in after an alert>
-TZK_SEAT_CATEGORY=First Class    # optional
-TZK_QUANTITY=1                   # optional
+TZK_MATCH_URL=<specific match page; defaults to the #/matches listing>
+TZK_PROFILE_DIR=<optional; default %LOCALAPPDATA%\tazkarti-monitor\browser-profile>
+
+# TZK_SEAT_CATEGORY and TZK_QUANTITY are GONE -- the code that read them was
+# deleted with the seat-selection scope. Do not reintroduce them; see the v2 table.
+```
+
+```bash
+# ── Always-on local runner (all optional; defaults are what is deployed) ──
+TZK_STATE_FILE=<baseline path>   # default: %LOCALAPPDATA%\tazkarti-monitor\last_seen_local.json
+TZK_DEBUG_DIR=<evidence dir>     # default: %LOCALAPPDATA%\tazkarti-monitor\debug
+TZK_NOTIFY_START=1               # Telegram on start-up; this is the reboot signal. 0 to mute.
+TZK_HEARTBEAT_HOURS=24           # "still alive" ping. 0 to mute -- but read the caveat first.
 ```
 
 **Repository Actions secrets (Settings → Secrets and variables → Actions → Secrets tab):**
@@ -771,7 +1142,7 @@ name by hand and paste only into the Value field.
     helper needs a human at the browser regardless — there is nothing to gain.
 11. **Never automate past the checkout boundary.** No auto-pay, no CAPTCHA solving. The
     boundary is deliberate and documented in the prefill docstring; leave that docstring intact.
-12. **Be polite to the server.** 10 minutes in CI, 30 seconds locally, single client, no
+12. **Be polite to the server.** 5 minutes in CI (GitHub's own floor, and this rule's), 30 seconds locally, single client, no
     parallel requests, no proxy rotation.
 13. **Changes to scraping logic land in both scripts in the same commit.** Do not hand-copy.
     Edit the block in `alahly_ticket_check.py` between the `SHARED SCRAPE BLOCK` markers, then
@@ -800,8 +1171,11 @@ notification.
 
 ### Failure detection
 Zero total match cards on the page means failure, not emptiness. Alert on the first failure,
-then once per hour (every 6th run at a 10-minute cadence) while it persists. Do not alert every
-run — an unfixable notification every 10 minutes trains you to ignore the bot entirely.
+then once per hour (`FAILURE_REALERT_EVERY = 12` runs at the `*/5` cadence) while it persists.
+Do not alert every run — an unfixable notification every few minutes trains you to ignore the
+bot entirely. **That constant counts RUNS, so it must track the cron interval: N = 60 /
+interval_mins.** It was 6 at `*/10`; leaving it there when the schedule moved to `*/5` would
+have silently halved the gap to 30 minutes.
 
 ### Alert content
 Telegram plain text. Show the delta, not the full list. Include the Tazkarti URL so it is one
@@ -935,7 +1309,11 @@ The booking modal is `#book-ticket-modal`, containing `.book-second-step` and
 
 ---
 
-### Phase 3 - prefill helper (BLOCKED 2026-08-25, step 1 done)
+### Phase 3 - login pre-fill helper (BUILT 2026-08-25, deliberately reduced scope)
+
+**The scope is: open a visible browser on a persistent profile, and type the two login fields
+in. That is all it does, and that is finished — not a stepping stone to something larger.**
+The human clicks Sign in and solves the CAPTCHA. The script never submits.
 
 **Login selectors - read from the live DOM 2026-08-25, each confirmed to resolve to exactly one
 element. NOT guessed.** Re-derive them by dumping `https://www.tazkarti.com/#/login`; note the
@@ -952,14 +1330,48 @@ https://www.tazkarti.com/#/login
                                 is recaptchaRef.execute())
 ```
 
-**These are recorded here but are deliberately NOT written into `alahly_ticket_prefill.py`,**
-because the reCAPTCHA finding means the login block should be deleted rather than repaired. They
-are kept because they are hard-won and because a persistent-profile implementation still needs to
-recognise the login page in order to detect a stale session.
+**These are now written into `alahly_ticket_prefill.py`.** `SIGN_IN_BUTTON` is defined there and
+**intentionally never clicked** — it is recorded because it was expensive to find and because it
+is how you confirm you are looking at the real login form. The file says so at the definition, so
+a future session does not "fix" the unused constant by wiring a `.click()` to it.
 
-**Still fabricated and unverified:** `#seat-category`, `#quantity`, `#add-to-cart`. Reaching the
-page that has them requires a logged-in session, so they cannot be derived until the login
-question is settled. Do not write code against them.
+**Session persistence — why the persistent profile actually works.** Read out of
+`main.57e770ff8543ee8f6d96.js`, not assumed:
+
+```js
+getToken   = () => localStorage.getItem("ETMS-Token")   // localStorage, NOT sessionStorage
+isLoggedIn = !!getToken()                               // the app's own definition
+clearCache = () => { localStorage.removeItem("ETMS-Token"); ... }   // logout / 401
+```
+
+`ETMS-Token`, `ETMS-RefreshToken`, `ETMS-ExpireToken` and `profileData` are all **localStorage**;
+only the *guest* token is sessionStorage. localStorage lives in the user-data dir, so it survives
+closing the browser — which is the entire premise of the rescope. **Verified empirically, not
+just read:** a token written by one process was read back by a different process after a full
+browser restart.
+
+**Stale-session detection, and its limit.** The site's header requests the cart-icon count on
+every page, and that request is authenticated; if the token is dead the response 401s and
+Tazkarti's own interceptor runs `clearCache()`, deleting `ETMS-Token`. So the script reads the
+token, lets the page settle, and reads it again — a token that vanished in between is a session
+the server just rejected. **Confirmed live** by planting a bogus token and watching the site
+delete it. The limit, which is written into the script's runbook too: every client-side signal
+(token, header, "Welcome <name>") comes from the same localStorage, so if the site makes no
+authenticated call while we look, a dead token can still read as LOGGED IN. The tell is then the
+ordinary one — the header says "Sign in" instead of your name.
+
+**`TZK_MATCH_URL` correctly defaults to the LISTING, and that is permanent, not a placeholder.**
+There is no per-match URL to point it at — see the roadmap section above for the evidence. The
+alert links to the same place for the same reason. Note what this means in practice: tapping the
+Telegram link opens the match **list**, and "Book Ticket" there sends you to `#/login` if that
+browser has no session. The persistent profile does NOT help — it is a Chromium user-data dir on
+the monitoring machine, and a phone is a different device with a different browser. Being signed
+in on the phone is a manual, human, one-time thing.
+
+**`#seat-category`, `#quantity`, `#add-to-cart` are GONE**, along with the code that used them.
+They were fabricated and never matched a real element. Deleted rather than left as TODOs, because
+a TODO reads as unfinished work and invites a future session to finish it. See the v2 table for
+why rebuilding them is low-value.
 
 **The boundary is unchanged and is not an unfinished TODO.** No auto-pay, no "Confirm", no CAPTCHA
 solving. The helper stops at the cart and hands control to the human. Keep the prefill docstring's
@@ -1003,6 +1415,48 @@ rm last_seen.json
 # Changing a character of the hash still fires, but produces the
 # no-transition-identified wording instead, which tests less.
 
+# ── THE ALWAYS-ON LOCAL RUNNER (Phase 4) ─────────────────────────
+# Install / re-install (idempotent -- re-run after editing the .ps1):
+powershell -ExecutionPolicy Bypass -File .\install_local_monitor_task.ps1
+
+# Is it alive?
+Get-ScheduledTask -TaskName "Tazkarti Local Monitor" | Select-Object State
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Select-Object ProcessId
+
+# What has it been doing? THIS is the console you do not otherwise have:
+Get-Content "$env:LOCALAPPDATA\tazkarti-monitor\monitor.log" -Tail 40
+Get-Content "$env:LOCALAPPDATA\tazkarti-monitor\monitor.log" -Wait   # live tail
+
+# Stop it for a while (the 1-minute watchdog WILL restart it otherwise):
+Disable-ScheduledTask -TaskName "Tazkarti Local Monitor"
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Enable-ScheduledTask -TaskName "Tazkarti Local Monitor"    # and it comes back within 60s
+
+# Remove it entirely:
+Unregister-ScheduledTask -TaskName "Tazkarti Local Monitor" -Confirm:$false
+
+# Verify reboot recovery (the one criterion not yet observed):
+#   reboot -> log in -> wait ~2 min -> expect a Telegram "Local Tazkarti
+#   watcher started" message. If it does not arrive, check the log above
+#   and Get-ScheduledTaskInfo -TaskName "Tazkarti Local Monitor".
+
+# ── THE LOGIN PRE-FILL HELPER (Phase 3) ──────────────────────────
+# Opens a VISIBLE browser on a persistent profile and types your login
+# in. You click Sign in and solve the CAPTCHA. It never submits.
+python alahly_ticket_prefill.py
+#   First run  -> "LOGGED OUT",     fills both fields, you sign in.
+#   Later runs -> "LOGGED IN",      goes straight to TZK_MATCH_URL.
+#   Stale one  -> "SESSION EXPIRED", fills both fields again.
+# Press Enter in the terminal to close -- that flush is what saves the
+# session. The file's own RUNBOOK section has the full detail.
+
+# Where the profile lives (holds a LIVE session token -- treat as a
+# credential, and keep it out of the repo and out of OneDrive):
+#   %LOCALAPPDATA%\tazkarti-monitor\browser-profile
+# Full reset, only if signing in repeatedly fails -- it also throws away
+# cookies and the profile's CAPTCHA reputation, so not routine:
+#   Remove-Item -Recurse -Force "$env:LOCALAPPDATA\tazkarti-monitor\browser-profile"
+
 # ── CHANGING THE SCRAPER (rule 13) ───────────────────────────────
 # Edit ONLY alahly_ticket_check.py, between the SHARED SCRAPE BLOCK
 # markers. Then:
@@ -1015,7 +1469,7 @@ python sync_shared_block.py --check   # run before every commit
 ## How to Deploy (GitHub Actions)
 
 **Already done:**
-- `.github/workflows/monitor.yml` committed with `cron: "*/10 * * * *"` + `workflow_dispatch`
+- `.github/workflows/monitor.yml` committed with `cron: "*/5 * * * *"` + `workflow_dispatch`
 - `permissions: contents: write` so the job can commit `last_seen.json` back
 - `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` added as repository secrets
 
@@ -1057,7 +1511,56 @@ passing suite would still fail to notice, and write that down as a criterion.**
       `NO LONGER ON SALE` / `REMOVED`, with the most actionable section first
 - [x] A partial listing is refused by comparing the rendered card count to the feed —
       `rendered 6 ... feed lists 10` when `View More` is suppressed
-- [ ] **A Phase 2 alert delivered to Telegram.** NOT yet done. See Not Yet Verified.
+- [x] **A Phase 2 alert delivered to Telegram** — 2026-08-25 22:25:37, from the local runner.
+
+**Acceptance criteria for Phase 4 (always-on local runner) — verified 2026-08-25:**
+- [x] The local monitor reads the full listing and the raw `matchStatus` — six consecutive
+      polls, `Parsed 10 match cards after 1 'View More' click(s), 1 of them Al Ahly.`, hash
+      `a086020c641a` on every one, matching the value Phase 2 recorded independently
+- [x] It keeps a baseline that CI cannot touch and cannot touch CI's — local writes went to
+      `%LOCALAPPDATA%`, and the repo's `last_seen.json` was byte-identical afterwards
+- [x] **A killed browser does not wedge the loop** — Chromium killed out from under a running
+      monitor at 22:22, `TargetClosedError` at 22:22:30, `Launched a fresh Chromium.` at
+      22:23:00, clean scrape at 22:23:03, `Recovered after 1 failed poll(s).`
+- [x] Sustained failure reaches Telegram — `maybe_alert_failure` delivered with a forced
+      threshold, and scheduled its repeat 120 polls (~1h) out
+- [x] A corrupt state file is loud, not silent — prints a WARNING and keeps the bad file as
+      `.corrupt`, instead of the old silent `return {}`
+- [x] **Killing the process restarts it** — killed twice; the watchdog brought it back in 82s
+      at the 5-minute interval and in 20s after tightening to 1 minute, reloading the existing
+      baseline (`No change.`, not a re-baseline)
+- [x] It survives a restart loop without spamming — second restart inside 10 minutes logged
+      `Skipping the start-up ping`
+- [ ] **Reboot recovery.** Not observed; no reboot performed. See Not Yet Verified.
+
+**What would a passing Phase 4 suite still miss?** That the machine is *awake*. Every check
+above passes identically on a laptop that is about to be closed and put in a bag. That gap is
+covered by the daily heartbeat and by keeping the CI job, not by a test — see the
+always-on caveat in Standing Blockers.
+
+**Acceptance criteria for Phase 3 (login pre-fill helper) — verified 2026-08-25:**
+- [x] Every selector it uses resolves to exactly one element on the live page — all three
+      re-derived from a fresh `#/login` dump, not trusted from these notes
+- [x] No fabricated selector and no `TODO` remains anywhere in the file — `#seat-category`,
+      `#quantity`, `#add-to-cart` are deleted along with the code that used them
+- [x] It never submits the login form — no `.click()` anywhere in the file; `SIGN_IN_BUTTON`
+      is defined, documented as intentionally unused, and never called
+- [x] A fresh profile reports `LOGGED OUT` and fills both fields, verified by round-tripping
+      the typed values — `Tazkarti ID filled: True (14 chars)` / `Password filled: True (14 chars)`
+- [x] **A dead session is not reported as a healthy one** — a planted bogus `ETMS-Token` was
+      deleted by the site's own 401 interceptor and correctly reported `SESSION EXPIRED`.
+      This is the criterion that caught the real bug: the first version tested for a bounce to
+      the login form, which the *public* listing page never does
+- [x] The profile persists localStorage across a full browser restart, across processes
+- [x] The logged-in case needs no credentials at all — they are read lazily, so a missing
+      `TZK_USERNAME` cannot break the common path
+- [ ] **The `LOGGED IN` path itself.** Needs a real sign-in. See Not Yet Verified.
+
+**What would a passing Phase 3 suite still miss?** That the session survives *days*, not just a
+restart. Every check above passes on a token minutes old. `ETMS-ExpireToken` and the refresh-token
+flow mean a long gap between runs is the untested case — and drop mornings are exactly when the
+gap will have been long. The mitigation is not a test: it is that `SESSION EXPIRED` degrades to
+the same pre-fill you would have got anyway, so the bad case costs one CAPTCHA, not a lost drop.
 
 **Asking what a passing suite would still miss is what caught two bugs this time.** The
 count-asserting test caught `NBE Club` being tracked as an Al Ahly fixture; running the local
@@ -1071,6 +1574,7 @@ reading the code, and the second had been latent since Phase 0.
 | Enhancement | Design consideration for today |
 |---|---|
 | ~~Ticket-availability signal instead of fixture-list~~ | ✅ BUILT 2026-08-25. See Feature Specs → Phase 2. |
+| **Seat-category / quantity / add-to-cart automation** — moved here from Phase 3 and **deleted from the code** 2026-08-25 | **LOW VALUE. Read this before rebuilding it.** Tazkarti allocates virtual-queue position by **arrival time**, so a pre-filled cart does not move you up the queue — being alerted 40 minutes earlier does, which is what Phase 4 exists for. It also cannot be built honestly today: the `#seat-category` / `#quantity` / `#add-to-cart` selectors were **fabricated**, never matched a real element, and cannot be derived without a logged-in session at a real drop. They were removed rather than left as `# TODO`, because a future session reads a TODO as unfinished work and tries to finish it. If it is ever rebuilt, derive the selectors from a live booking modal (`#book-ticket-modal`, `.book-second-step`) and keep rule 11's boundary: stop at the cart, never click Pay. |
 | Self-hosted runner in Egypt | The fallback if the geo-block hypothesis is confirmed. A Raspberry Pi or a cheap always-on box running the *local* script is simpler than a self-hosted Actions runner — prefer it. |
 | Multiple teams | Filter predicate is already isolated in the page script. Make it a list of patterns, not a hardcoded one. |
 | Per-match alert routing | Telegram supports multiple chat IDs. `CHAT_ID` would become a comma-separated list. |

@@ -52,9 +52,13 @@ TZK_URL = os.environ.get("TZK_URL", "https://www.tazkarti.com/#/matches")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Re-alert about a persistent failure every N runs so you get one
-# nudge per hour at a 10-minute cadence, not one every 10 minutes.
-FAILURE_REALERT_EVERY = 6
+# Re-alert about a persistent failure every N runs so you get one nudge
+# per HOUR, not one per run. This is a count of runs, so it has to track
+# the cron interval: it was 6 at */10, and moving the schedule to */5
+# without doubling it would have silently halved the gap to 30 minutes --
+# exactly the notification fatigue the failure-detection spec warns about.
+# If the cron changes again, change this with it: N = 60 / interval_mins.
+FAILURE_REALERT_EVERY = 12
 
 # A real browser UA. Headless Chromium's default UA contains
 # "HeadlessChrome", which is the single easiest bot signal to filter on.
@@ -74,8 +78,22 @@ USER_AGENT = (
 # is how these two files drifted apart in the first place.
 # ====================================================================
 
-STATE_FILE = "last_seen.json"
-DEBUG_DIR = "debug"
+# Both of these default to a path NEXT TO THIS SCRIPT rather than to the
+# process's working directory. Task Scheduler does not set a working
+# directory, so a bare relative path there writes the baseline into
+# C:\Windows\System32 instead of the repo -- and a baseline the next run
+# cannot find reads as "no baseline yet", which re-establishes silently
+# and loses the alert. CI is unaffected: it runs from the repo root, so
+# the resolved path is the same file it always was.
+#
+# TZK_STATE_FILE exists so the always-on local runner can keep its OWN
+# baseline. The 30s local loop and the 10-minute CI job watch the same
+# site; pointed at one file they overwrite each other's hash, and each
+# one's write makes the other's next run see a change that never
+# happened. Separate files, no cross-fire.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.environ.get("TZK_STATE_FILE") or os.path.join(_SCRIPT_DIR, "last_seen.json")
+DEBUG_DIR = os.environ.get("TZK_DEBUG_DIR") or os.path.join(_SCRIPT_DIR, "debug")
 
 
 class ScrapeError(RuntimeError):
@@ -123,22 +141,59 @@ def status_label(raw) -> str:
 # --------------------------------------------------------------------
 
 def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
+    """Read the baseline, and be LOUD if one exists but cannot be read.
+
+    The old version swallowed every error and returned {}, which the
+    callers cannot tell apart from "no baseline yet" -- so a corrupt file
+    silently re-established the baseline and threw away the alert that
+    was about to fire. That is rule 1 in a different costume, and the
+    local runner makes it likelier: it rewrites this file every 30
+    seconds, so an unclean shutdown has ~2,880 chances a day to catch a
+    half-written one. utf-8-sig because a state file that has been
+    through a Windows editor or PowerShell carries a BOM, which plain
+    utf-8 rejects.
+    """
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, encoding="utf-8-sig") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        # Not fatal -- refusing to run helps nobody. But say so, keep the
+        # unreadable file for post-mortem, and let the caller re-baseline
+        # knowing it happened rather than assuming a fresh install.
+        print(f"WARNING: {STATE_FILE} exists but could not be read ({e}). "
+              f"Re-establishing the baseline; ONE change may go unalerted.")
         try:
-            with open(STATE_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError):
+            os.replace(STATE_FILE, STATE_FILE + ".corrupt")
+            print(f"Kept the unreadable file as {STATE_FILE}.corrupt")
+        except OSError:
             pass
-    return {}
+        return {}
 
 
 def save_state(state: dict) -> None:
     state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat(
         timespec="seconds"
     )
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    # STATE_FILE may now live outside the repo (the local runner keeps its
+    # baseline under LOCALAPPDATA), so the directory is not guaranteed to
+    # exist on a first run.
+    parent = os.path.dirname(STATE_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    # Write-then-rename, so the baseline is never observed half-written.
+    # os.replace is atomic within a volume on Windows as well as POSIX.
+    # Without this, losing power partway through one of the local
+    # runner's writes leaves a truncated file that the next start cannot
+    # parse -- see load_state().
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_FILE)
 
 
 # --------------------------------------------------------------------
