@@ -11,9 +11,16 @@ No server, no database, no web UI. State is a single JSON file committed back to
 
 **Phases 0, 1 and 2 are DONE. The monitor reads the entire listing and now alerts on
 `matchStatus` — "tickets are buyable" — rather than on the fixture list changing. It currently
-tracks `ZED FC vs Al Ahly FC` (matchStatus 1, AVAILABLE). There is no blocking bug. The one
-thing not yet proven is a Phase 2 alert actually arriving in Telegram; see Not Yet Verified.
-Phase 3 (the prefill helper) is the next work and is still gated — see its entry.**
+tracks `ZED FC vs Al Ahly FC` (matchStatus 1, AVAILABLE). There is no blocking bug in the
+monitor. The one thing not yet proven is a Phase 2 alert actually arriving in Telegram; see
+Not Yet Verified.**
+
+**Phase 3 started 2026-08-25 and immediately hit a wall: Tazkarti's login is behind an
+invisible reCAPTCHA v2 whose token is a REQUIRED field of the login API call. Automating the
+login step is therefore off the table — not "hard", impossible without solving a CAPTCHA,
+which rule 11 forbids. The proposed replacement is a persistent browser profile you log into
+by hand once. AWAITING THE USER'S CONFIRMATION before any code is written; see the Phase 3
+blocker in Standing Blockers.**
 
 Repo: `mohaitham22/tazkarti-bot` — **PUBLIC**. Every rule about secrets in this file follows
 from that one fact.
@@ -30,7 +37,10 @@ Phase 1  ✅ DONE         GitHub Actions migration so the monitor runs without a
 Phase 2  ✅ DONE         Signal is now each fixture's raw matchStatus, not the fixture list.
                          Verified against the live site 2026-08-25. Telegram delivery of a
                          Phase 2 alert is the one thing still unproven.
-Phase 3  ⬜ NOT STARTED  Pre-fill helper: replace TODO selectors with Tazkarti's real ones.
+Phase 3  🚧 BLOCKED      Pre-fill helper. Login selectors FOUND and confirmed, but the login
+                         step cannot be automated — invisible reCAPTCHA v2 gates it. Rescope
+                         to an already-logged-in browser profile. Not yet agreed; no code
+                         written.
 ```
 
 **Phase 2 landed the availability signal AND handed Phase 3 what it was waiting for: the feed
@@ -39,6 +49,9 @@ identifier Phase 3 needs. `TZK_MATCH_URL` can be derived from it instead of bein
 hand — but the URL shape has NOT been confirmed yet, so confirm it against the live site before
 building on it.**
 **Phase 3 is LOCAL ONLY and never runs in CI. See Coding Rules.**
+**Phase 3 step 1 is DONE — the login selectors are real and verified. Steps 2–4 (submit login,
+navigate to the match, add to cart) are all downstream of a login that cannot be automated, so
+none of them can proceed until the scope decision is made.**
 
 ---
 
@@ -91,7 +104,7 @@ three, so it could not previously have served as a reference for any of them.
 | `alahly_ticket_check.py` | ✅ Verified locally, CI run pending | Source of truth for the shared block. Parses the FULL listing, reads raw `matchStatus`, detects availability change, alerts, fails loudly, preserves the baseline on failure, recovers. |
 | `alahly_ticket_monitor.py` | ✅ Trustworthy reference | Local loop, `POLL_SECONDS = 30`. Shared block copied by `sync_shared_block.py` and SHA-verified identical. Four consecutive polls verified locally. |
 | `sync_shared_block.py` | ✅ New, working | Enforces rule 13 mechanically. `python sync_shared_block.py` copies the block from the check script into the monitor; `--check` verifies and exits 1 on drift. Run `--check` before committing. |
-| `alahly_ticket_prefill.py` | ⬜ Skeleton | Every selector a `TODO`. Never run for real. |
+| `alahly_ticket_prefill.py` | 🚧 Skeleton, UNCHANGED this session | Still every selector a `TODO`; still never run for real. The three LOGIN selectors are now known (see Feature Specs → Phase 3) but were deliberately NOT written in, because the reCAPTCHA finding means the login block gets deleted rather than fixed. The seat-category / quantity / add-to-cart selectors remain fabricated and unverified. |
 | `get_telegram_chat_id.py` | ✅ Working | One-shot helper, purpose served. |
 | `.github/workflows/monitor.yml` | ✅ Working | `cron: */10`, `contents: write`, `checkout@v5` / `setup-python@v6`, Playwright cache, artifact upload on failure, concurrency group. Node 20 warning gone. |
 | `last_seen.json` | ✅ Migrated to v3 | `{hash: a086020c...66c5, matches: [{match_id: 2559, fixture: "ZED FC vs Al Ahly FC", status: 1, ...}]}`. `matches` is now a list of OBJECTS, not strings, and the hash covers `matchStatus`. Not comparable with any pre-2026-08-25 hash. |
@@ -157,8 +170,34 @@ three, so it could not previously have served as a reference for any of them.
 - **Scheduled workflows are disabled after 60 days of repository inactivity.** Currently
   defused by the commit-every-run behaviour above. If that is ever "fixed", this comes back.
 - **GitHub cron drift** — `*/10` is a request, not a promise. Observed gaps of 8–45 minutes.
-- **Prefill selectors are fabricated** — `#username`, `#password`, `#login-button`,
-  `#seat-category`, `#quantity`, `#add-to-cart` were invented. None verified.
+- **Prefill selectors are fabricated** — PARTIALLY RESOLVED 2026-08-25. `#username`,
+  `#password` and `#login-button` are replaced by real, verified selectors (see Feature Specs
+  → Phase 3), though they are recorded there rather than written into the script. The other
+  three — `#seat-category`, `#quantity`, `#add-to-cart` — were invented and are still
+  unverified, because reaching the page that has them requires a logged-in session.
+- **🚧 PHASE 3 BLOCKER: Tazkarti's login cannot be automated — invisible reCAPTCHA v2.**
+  *Symptom:* the login form at `#/login` renders `<re-captcha size="invisible"
+  id="ngrecaptcha-0">` (sitekey `6LcgZfUsAAAAAAji0eMKvFPicrHdkNbPQ9gneFJo`) between the
+  password field and the Sign in button, with the `bframe` challenge iframe preloaded. It is
+  not decorative: in `main.57e770ff8543ee8f6d96.js` the API call is
+  `this._http.post(url+"Login", {Username:e, Password:n, recaptchaResponse:t})` — the token is
+  a required field — and the Sign in button's click handler is `recaptchaRef.execute()`, not a
+  submit. Login only fires from reCAPTCHA's own callback:
+  `resolved: function(e,n){ this.recaptchaResponse=e, e ? (this.submitted=!0, this.submitLogin(n)...`
+  So there is NO code path to a session without a Google-issued token.
+  *Fix path:* do not chase it. Solving or bypassing it is forbidden by rule 11 and by the
+  prefill docstring's stated boundary, and relying on the invisible challenge silently passing
+  a headless browser's risk score is the kind of thing that works in testing and fails on the
+  morning tickets actually drop. Rescope to `launch_persistent_context()` with a dedicated
+  user-data dir: the human signs in once by hand in that window — CAPTCHA and any OTP included
+  — the session cookie persists in the profile, and the helper reuses it and skips login
+  entirely. It must detect a stale session and stop with "log in again" rather than silently
+  prefilling nothing. **Not yet agreed with the user; no code written.**
+- **Login may also be behind an OTP — UNKNOWN, not ruled out.** `main.57e770ff8543ee8f6d96.js`
+  contains `id="btn_sendOTP"`, itself also gated behind `recaptchaRef.execute()`. Whether the
+  *login* flow triggers it cannot be determined without submitting the form, and submitting is
+  blocked by the reCAPTCHA above. If it does, it is a second, independent reason the login step
+  cannot be automated — and the persistent-profile rescope handles both at once.
 
 ## ⚠️ SESSION MEMORY PROTOCOL — READ THIS AT THE START OF EVERY SESSION
 
@@ -197,6 +236,7 @@ lesson of Phase 1.**
 | 2026-08-24 | 1 → ✅ | Verified all three failure paths in CI (runs #10/#11/#12). Found + fixed a silent Telegram delivery failure. Rotated leaked credentials. Found the page-1 pagination bug. | Scraper reads 6 of 10 matches and is missing live `ZED FC vs Al Ahly FC`. | Decide the `View More` fix, then apply it to BOTH scripts in one commit. |
 | 2026-08-25 | 1 → 2 | Fixed pagination in both scripts (`8178263`); scraper reads all 10 fixtures and now tracks `ZED FC vs Al Ahly FC`. Real alert delivered, run #44. Aligned the local monitor with the CI script. Fixed a truncated `TZK_URL` in `.env`. | None blocking. | Phase 2: read `.status` per match, alert on availability rather than on fixture-list changes. |
 | 2026-08-25 | 2 → ✅ | Phase 2 built. Signal is now the raw `matchStatus` from the page's own JSON feed, not `.team-names`. Structured state (v3), transition-aware alert wording, DOM/feed cross-check. Fixed two bugs found by testing: `NBE Club` tracked as Al Ahly, and the SPA never reloading between polls. Added `sync_shared_block.py` to enforce rule 13 mechanically. | Phase 2 alert not yet delivered to Telegram; not yet run in CI. | Force one alert to prove delivery, watch the first scheduled CI run, then Phase 3. |
+| 2026-08-25 | 3 🚧 | Phase 3 step 1 only. Dumped the real login DOM and replaced three of the six fabricated selectors with verified ones (`input[name="txtFanId"]`, `input[name="txtPassword"]`, `form button.button-green`). Ran a visible fill with no submit — both fields round-tripped. Then STOPPED: login is gated by an invisible reCAPTCHA v2 that is a required field of the login API. No project code changed. | Login cannot be automated (reCAPTCHA v2, required token). OTP after login unknown. `TZK_MATCH_URL` still points at the listing, not a match page. | Get the user's decision on the persistent-profile rescope. If yes, rewrite the prefill helper around `launch_persistent_context()` and delete the login block, then confirm the per-match URL shape from `matchId` 2559. |
 
 ### Session Notes (Full Detail)
 
@@ -416,6 +456,97 @@ in CI yet. `send_telegram()` is unchanged and previously proven, and `describe_c
 unit-tested for every transition, but neither fact is delivery. Force one alert before trusting
 this: set the tracked fixture's `status` to `4` in `last_seen.json` and run the script.
 
+**Session 2026-08-25 (third) - Phase 3 step 1, then a hard stop**
+
+Brief was explicit: replace the six fabricated selectors in `alahly_ticket_prefill.py`, work one
+step at a time, stop after each for verification - and, critically, *"if Tazkarti's login is
+behind a CAPTCHA or an OTP, stop and tell me."* That last clause is what this session turned out
+to be about.
+
+*Pre-flight.* `last_seen.json` is v3 with object entries and an integer `status` (hash
+`a086020c...66c5`, `ZED FC vs Al Ahly FC`, status 1) - not the empty-string hash.
+`python sync_shared_block.py --check` printed `In sync: 501 lines, sha256 155cbaf83039...`,
+exit 0. Nothing to fix before starting.
+
+*Selectors were read, never guessed - same method as Phase 2.* A read-only Playwright dump of
+`https://www.tazkarti.com/#/login` went to `debug/phase3-login-route.html`,
+`debug/phase3-login-route.json` and `debug/phase3-login-route.png`. The dump script lives in the
+session scratchpad, not the repo. **The form has no `id` attributes at all** - Angular renders it
+with `name` attributes only, so every single `#`-prefixed selector in the existing script was
+structurally incapable of matching anything, not merely pointed at the wrong thing.
+
+| Fabricated | Real, confirmed | Detail |
+|---|---|---|
+| `#username` | `input[name="txtFanId"]` | label `Tazkarti ID *`, `maxlength=16`, placeholder `12345678901234` |
+| `#password` | `input[name="txtPassword"]` | `maxlength=20` |
+| `#login-button` | `form button.button-green` | text `Sign in`, **`type="button"`** - not a native submit |
+
+*Step 1 executed as asked: visible browser, fill, no submit.* Each of the three selectors plus
+`re-captcha#ngrecaptcha-0` resolved to exactly **1 element**. Both fields round-tripped their
+values via `input_value()` (`fan id filled correctly: True (len 14)` /
+`password filled correctly: True (len 14)`), and the button read `text='Sign in' disabled=False`.
+Screenshot at `debug/phase3-step1-filled.png`, left on disk rather than pasted into the
+transcript because it shows the Tazkarti ID in plain text; `debug/` is gitignored, confirmed with
+`git check-ignore -v`. **Nothing was submitted.**
+
+*The stop condition, and why it is not negotiable.* The dump flagged
+`captcha markers: ['captcha', 'g-recaptcha', 'recaptcha']` and two live Google iframes - the
+`anchor` and, notably, the `bframe` challenge frame. The form carries
+`<re-captcha size="invisible" id="ngrecaptcha-0">` with sitekey
+`6LcgZfUsAAAAAAji0eMKvFPicrHdkNbPQ9gneFJo`, sitting between the password field and Sign in.
+
+Rather than assume, this was confirmed against the compiled bundle
+`main.57e770ff8543ee8f6d96.js` (2.9 MB, fetched once). Two findings settle it:
+
+```js
+// the token is a REQUIRED field of the login request
+login: function(e,n,t){ ... this._http.post(url+"Login", {Username:e, Password:n, recaptchaResponse:t}) }
+
+// the Sign in button does not submit -- it only kicks off the captcha
+(click) -> e.component.recaptchaRef.execute()
+
+// login fires ONLY from reCAPTCHA's own callback
+resolved: function(e,n){ this.recaptchaResponse=e, e ? (this.submitted=!0, this.submitLogin(n), ...) : ... }
+```
+
+There is no code path to a session without a Google-issued token. The only two ways past are
+solving the challenge - forbidden by rule 11 and by the prefill docstring's stated boundary,
+which the brief also reaffirmed - or hoping the invisible challenge silently passes a headless
+browser's risk score, which is precisely the sort of thing that works while you are testing it
+and fails at 9am on the morning tickets drop. Stopped here and reported, per the brief.
+
+*A second, independent gate may also exist.* The same bundle contains `id="btn_sendOTP"`, also
+wired to `recaptchaRef.execute()`. Whether **login** triggers an OTP cannot be determined without
+submitting, and submitting is blocked by the reCAPTCHA. Recorded as UNKNOWN rather than ruled
+out. Note the bundle also has `0 == getAllowRecaptcha() && (isCheckRecaptcha=!0, showRecaptcha=!1)`
+- a server-side kill switch - but production currently renders the widget, so it is on. Do not
+build on it being off.
+
+*Incidental finding: `TZK_USERNAME` is not an email.* The prefill docstring and the Environment
+Variables section both described it as "your Tazkarti account email". The field is `Tazkarti ID *`
+and wants a 14-16 digit numeric ID. The value in `.env` is already a correct 14-digit one
+(verified by shape - `len=14 all_digits=True` - without printing it), so only the documentation
+was wrong. Environment Variables is now corrected; the docstring is not, because the script is
+about to be rewritten.
+
+*`TZK_MATCH_URL` is still wrong for its purpose.* It reads `https://www.tazkarti.com/#/matches` -
+the listing, not a match page. Deriving it from `matchId` 2559 is still unconfirmed, exactly as
+the Phase 2 notes warned. That is a step-3 problem and needs a read-only navigation, no login.
+
+*What changed in the repo: only this file.* `alahly_ticket_prefill.py` was deliberately **not**
+touched. The three real login selectors are recorded in Feature Specs -> Phase 3, but writing
+them into the script would have been writing code we are about to delete - under the proposed
+rescope the login block goes away entirely, along with `TZK_USERNAME` and `TZK_PASSWORD`, which is
+a real side benefit given both were in the `.env` committed to public history in `b8ccce9`.
+
+*`last_seen.json` did NOT change meaning this session.* Still v3, still
+`{match_id, fixture, status, status_label, status_badge, status_class}` with the hash covering the
+raw `matchStatus`. Nothing in Phase 3 reads or writes it, and no scraping logic was touched, so
+`sync_shared_block.py --check` is still clean and rule 13 is not in play.
+
+*Next session must start by getting a decision, not by writing code.* The rescope to a persistent
+browser profile is a proposal the user has not yet accepted.
+
 ---
 
 ## What We Are Building
@@ -597,7 +728,12 @@ TELEGRAM_BOT_TOKEN=<from @BotFather>
 TELEGRAM_CHAT_ID=<from get_telegram_chat_id.py>
 
 # ── Prefill helper (LOCAL .env ONLY — NEVER in GitHub secrets) ───
-TZK_USERNAME=<your Tazkarti account email>
+# NOTE: TZK_USERNAME is NOT an email. The login field is "Tazkarti ID *"
+# (input[name="txtFanId"], maxlength 16, placeholder 12345678901234) and wants
+# a 14-16 digit numeric ID. The value currently in .env is a correct 14-digit
+# one; only the prefill docstring's description of it was wrong.
+# BOTH of these become unnecessary if the persistent-profile rescope is agreed.
+TZK_USERNAME=<your 14-16 digit Tazkarti ID>
 TZK_PASSWORD=<your Tazkarti account password>
 TZK_MATCH_URL=<specific match page, filled in after an alert>
 TZK_SEAT_CATEGORY=First Class    # optional
@@ -796,6 +932,38 @@ rather than text so it survives an Arabic render; see the pagination record abov
 
 The booking modal is `#book-ticket-modal`, containing `.book-second-step` and
 `.book-ticket-modal-footer`. That is Phase 3 territory and is still unverified.
+
+---
+
+### Phase 3 - prefill helper (BLOCKED 2026-08-25, step 1 done)
+
+**Login selectors - read from the live DOM 2026-08-25, each confirmed to resolve to exactly one
+element. NOT guessed.** Re-derive them by dumping `https://www.tazkarti.com/#/login`; note the
+form carries **no `id` attributes**, so select on `name`:
+
+```
+https://www.tazkarti.com/#/login
+  form
+    input[name="txtFanId"]      label "Tazkarti ID *", maxlength 16, placeholder 12345678901234
+                                -- a 14-16 digit numeric ID, NOT an email
+    input[name="txtPassword"]   maxlength 20
+    re-captcha#ngrecaptcha-0    invisible reCAPTCHA v2 -- THE BLOCKER, see Standing Blockers
+    button.button-green         text "Sign in", type="button" (NOT a submit; its click handler
+                                is recaptchaRef.execute())
+```
+
+**These are recorded here but are deliberately NOT written into `alahly_ticket_prefill.py`,**
+because the reCAPTCHA finding means the login block should be deleted rather than repaired. They
+are kept because they are hard-won and because a persistent-profile implementation still needs to
+recognise the login page in order to detect a stale session.
+
+**Still fabricated and unverified:** `#seat-category`, `#quantity`, `#add-to-cart`. Reaching the
+page that has them requires a logged-in session, so they cannot be derived until the login
+question is settled. Do not write code against them.
+
+**The boundary is unchanged and is not an unfinished TODO.** No auto-pay, no "Confirm", no CAPTCHA
+solving. The helper stops at the cart and hands control to the human. Keep the prefill docstring's
+explanation of both boundaries intact - the brief reaffirmed this explicitly.
 
 ---
 
