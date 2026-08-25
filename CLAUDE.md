@@ -3,8 +3,8 @@
 ## TL;DR
 A personal ticket-availability watcher. Polls Tazkarti's public match listing with headless
 Playwright, detects when the Al Ahly fixture list changes, and pushes a Telegram message.
-A separate local-only helper opens a visible browser that remembers your login and types your
-credentials into the login form — then stops. You click Sign in and solve the CAPTCHA yourself.
+There is NO login/prefill helper. There was one; it was removed 2026-08-26 because it earned
+nothing — see Phase 3 below. Logging in is a thing you do in your ordinary browser.
 
 Stack: Python 3.12 + Playwright (Chromium) + Telegram Bot API + GitHub Actions (cron).
 No server, no database, no web UI. State is a single JSON file committed back to the repo.
@@ -39,12 +39,10 @@ Phase 1  ✅ DONE         GitHub Actions migration so the monitor runs without a
 Phase 2  ✅ DONE         Signal is now each fixture's raw matchStatus, not the fixture list.
                          Verified against the live site 2026-08-25, and a Phase 2 alert has
                          since been delivered to Telegram from the local runner.
-Phase 3  ✅ DONE (cut)   Login pre-fill helper, rescoped. Persistent browser profile keeps the
-                         session; the script fills the two login fields and stops. It never
-                         submits — invisible reCAPTCHA v2 makes that impossible, so the human
-                         clicks Sign in. Seat/quantity/cart code DELETED, not deferred.
-                         Verified live 2026-08-25 for LOGGED OUT and SESSION EXPIRED; the
-                         LOGGED IN path needs a human CAPTCHA solve and is unproven.
+Phase 3  ❌ REMOVED      Prefill helper. Built, then DELETED 2026-08-26 without ever once
+                         completing a login. Do not rebuild it. The reasons are recorded
+                         under 'Phase 3 — why there is no prefill helper' below; read that
+                         before entertaining the idea again.
 Phase 4  ✅ DONE         Always-on local runner. alahly_ticket_monitor.py now runs under
                          Windows Task Scheduler at 30s, with its own state file, browser-crash
                          recovery, sustained-failure alerting and a rotating log. Verified
@@ -136,7 +134,7 @@ three, so it could not previously have served as a reference for any of them.
 | `alahly_ticket_check.py` | ✅ Verified locally, CI run pending | Source of truth for the shared block. Parses the FULL listing, reads raw `matchStatus`, detects availability change, alerts, fails loudly, preserves the baseline on failure, recovers. |
 | `alahly_ticket_monitor.py` | ✅ Trustworthy reference | Local loop, `POLL_SECONDS = 30`. Shared block copied by `sync_shared_block.py` and SHA-verified identical. Four consecutive polls verified locally. |
 | `sync_shared_block.py` | ✅ New, working | Enforces rule 13 mechanically. `python sync_shared_block.py` copies the block from the check script into the monitor; `--check` verifies and exits 1 on drift. Run `--check` before committing. |
-| `alahly_ticket_prefill.py` | ✅ Rewritten and RUN for real | Login pre-fill only, and that is the finished scope. `launch_persistent_context` on a profile outside the repo; real `name`-based selectors; reports LOGGED IN / SESSION EXPIRED / LOGGED OUT; fills both fields and verifies the round-trip; **never submits**. Credentials read lazily, so the logged-in case needs none. No fabricated selectors and no TODOs remain. Carries its own RUNBOOK. |
+| `alahly_ticket_prefill.py` | ❌ **REMOVED 2026-08-26** | Built, rescoped twice, and deleted without ever completing a single login. Do not rebuild it — read Feature Specs → 'Phase 3 — why there is no prefill helper' first. Recoverable from git history if you want to read it. |
 | `get_telegram_chat_id.py` | ✅ Working | One-shot helper, purpose served. |
 | `.github/workflows/monitor.yml` | ✅ Working | `cron: */5` (the floor GitHub allows), `contents: write`, `checkout@v5` / `setup-python@v6`, Playwright cache, artifact upload on failure, concurrency group. Node 20 warning gone. |
 | `last_seen.json` | ✅ Migrated to v3 | `{hash: a086020c...66c5, matches: [{match_id: 2559, fixture: "ZED FC vs Al Ahly FC", status: 1, ...}]}`. `matches` is now a list of OBJECTS, not strings, and the hash covers `matchStatus`. Not comparable with any pre-2026-08-25 hash. |
@@ -189,17 +187,16 @@ three, so it could not previously have served as a reference for any of them.
   `event: schedule`, and note the REAL gaps between them — if they still cluster at 8–45
   minutes, that is the drift blocker, not a broken schedule, and nothing is wrong with the
   config. Also worth one glance: `FAILURE_REALERT_EVERY = 12` has never fired at the new cadence.
-- **Being signed in on the PHONE.** Nothing in this repo can do this and nothing tests it. The
-  alert links to `#/matches`, and Book Ticket there goes to `#/login` if that browser has no
-  session — verified live. Sign in once in your phone's browser so a drop alert is one tap.
-  This is the single highest-value manual step left, and it is worth more than any code here.
-- **The prefill helper's LOGGED IN path.** `LOGGED OUT` and `SESSION EXPIRED` were both verified
-  against the live site 2026-08-25. `LOGGED IN` cannot be reached without a real sign-in, which
-  needs a human CAPTCHA solve, so it has never executed. Verify it by running
-  `python alahly_ticket_prefill.py`, signing in for real, pressing Enter, then running it a
-  second time: expect `Status:  LOGGED IN` and `Already signed in as <your name>`. **Until that
-  is done, "the session persists across runs" is proven for a planted token but not for a real
-  one.**
+- **Being signed in on the PHONE — DONE 2026-08-25 (user reported).** The alert links to
+  `#/matches`, and Book Ticket there goes to `#/login` if that browser has no session — verified
+  live. The user signed in on their phone, so a drop alert should now be one tap.
+  **But treat this as perishable, not finished.** Nothing in this repo can see that session,
+  nothing tests it, and nothing will warn you when it lapses — Tazkarti sessions carry an
+  expiry and a refresh token, so the phone can be logged out silently by time, a cleared
+  browser, or a sign-out on another device. **Re-check it periodically, and specifically before
+  any match you actually care about:** open `#/matches` on the phone and tap Book Ticket. Modal
+  = good. A jump to `#/login` = sign in again. This is the one link in the whole chain with no
+  monitoring behind it.
 
 ### Standing Blockers
 
@@ -341,6 +338,7 @@ lesson of Phase 1.**
 | 2026-08-25 | 2 → ✅ | Phase 2 built. Signal is now the raw `matchStatus` from the page's own JSON feed, not `.team-names`. Structured state (v3), transition-aware alert wording, DOM/feed cross-check. Fixed two bugs found by testing: `NBE Club` tracked as Al Ahly, and the SPA never reloading between polls. Added `sync_shared_block.py` to enforce rule 13 mechanically. | Phase 2 alert not yet delivered to Telegram; not yet run in CI. | Force one alert to prove delivery, watch the first scheduled CI run, then Phase 3. |
 | 2026-08-25 | 4 ✅ | Promoted the local monitor to an always-on 30s runner under Task Scheduler. Separate state file, browser-crash recovery, sustained-failure alerting, rotating log, atomic + loud state I/O. Delivered the first-ever Phase 2 alert to Telegram. | Machine is a laptop — always-on only while on AC + Ethernet. Reboot recovery not observed. | Reboot once, confirm the `✅ started` ping arrives. Then Phase 3's scope decision. |
 | 2026-08-25 | 3 🚧 | Phase 3 step 1 only. Dumped the real login DOM and replaced three of the six fabricated selectors with verified ones (`input[name="txtFanId"]`, `input[name="txtPassword"]`, `form button.button-green`). Ran a visible fill with no submit — both fields round-tripped. Then STOPPED: login is gated by an invisible reCAPTCHA v2 that is a required field of the login API. No project code changed. | Login cannot be automated (reCAPTCHA v2, required token). OTP after login unknown. `TZK_MATCH_URL` still points at the listing, not a match page. | Get the user's decision on the persistent-profile rescope. If yes, rewrite the prefill helper around `launch_persistent_context()` and delete the login block, then confirm the per-match URL shape from `matchId` 2559. |
+| 2026-08-26 | 3 ❌ | **REMOVED `alahly_ticket_prefill.py`.** It never completed a single login — the profile was checked and held no `ETMS-Token`. Root cause of the reCAPTCHA failures found: a second browser launched on a profile still held by an earlier window, which corrupts cookie/storage state while every reCAPTCHA request still returns 200. Deleted the script, the profile, and the Tazkarti credentials from `env.example`. | None. Removing it took `TZK_USERNAME`/`TZK_PASSWORD` out of the repo entirely, which is a security win given `b8ccce9`. | Reboot for the last Phase 4 criterion. Re-check the PHONE login before any match that matters. |
 | 2026-08-25 | 3 ✅ / CI | Chased the per-match URL to a definitive NEGATIVE: it does not exist, so the alert's existing link is already optimal. Cut CI cron `*/10` → `*/5` (GitHub's floor) and doubled `FAILURE_REALERT_EVERY` 6 → 12 to keep failure nudges hourly. | `*/5` does not mean a 5-minute signal — drift is unchanged. State commits now ~288/day. | Sign in once for real to prove the prefill LOGGED IN path; sign in on the PHONE so the alert link is one tap; reboot for the Phase 4 criterion. |
 | 2026-08-25 | 3 ✅ | Rescope AGREED and built. `alahly_ticket_prefill.py` rewritten: persistent profile, login pre-fill only, never submits. Deleted seat/quantity/add-to-cart entirely. Re-verified the login selectors live. Found that the session token is **localStorage**, so the profile really does persist a login. Ran it for real — LOGGED OUT and SESSION EXPIRED both verified against the live site. | LOGGED IN path unproven (needs a human CAPTCHA solve). `TZK_MATCH_URL` still the listing, not a match page. | Sign in once for real to prove the LOGGED IN path and confirm the session survives a restart. Then reboot the machine for the outstanding Phase 4 criterion. |
 
@@ -880,6 +878,51 @@ then run end-to-end against a **scratch state file** so the repo baseline was no
 `ZED FC vs Al Ahly FC -- AVAILABLE (matchStatus=1)` / quiet v2→v3 migration / exit 0, no alert
 sent. `git diff last_seen.json` was empty afterwards, as intended.
 
+**Session 2026-08-26 — the prefill helper was removed**
+
+*What happened.* Repeated attempts to sign in inside the helper's browser failed with
+`Could not connect to the reCAPTCHA service`, while diagnostics showed reCAPTCHA loading
+perfectly: every request 200, `window.grecaptcha` defined, both iframes rendered, no console
+errors, in both bundled Chromium and real Chrome. That contradiction is what took the time.
+
+*The actual cause, found late.* An earlier helper window was **still running** and holding the
+profile directory — six processes on `ms-playwright\chromium-1223`. Every later run launched a
+second browser onto the same user-data dir. Two Chromium instances sharing one profile corrupt
+the cookie and storage state reCAPTCHA depends on, and the failure surfaces as a *network*
+error that is not a network error. This also explains why `channel="chrome"` died instantly
+with `TargetClosedError` — real Chrome respects the profile lock, bundled Chromium apparently
+launched anyway and made things worse.
+
+**That lesson outlived the code and is recorded in Feature Specs → Phase 3. Any future script
+using a persistent browser profile must check for a live process holding it before launching,
+and must not trust `lockfile` — clean exits leave one behind, so its presence proves nothing.**
+
+*Why it was removed rather than fixed.* The user's call, and the right one. Even with the lock
+bug fixed, the helper could not earn its keep:
+
+- It served the desktop, but a drop alert is acted on from the **phone**. Queue position is by
+  arrival time; nothing on the PC makes you earlier.
+- After the seat/quantity cut, its whole job was typing two fields — which the browser's own
+  password manager does better, with no lock, no CAPTCHA fight, no maintenance.
+- It was the **only** reason this repo wanted Tazkarti credentials. Removing it took
+  `TZK_USERNAME` and `TZK_PASSWORD` out of `env.example` and out of the project's needs
+  entirely. Given `.env` with those exact credentials was once committed to this PUBLIC repo
+  (`b8ccce9`), that is a permanent security improvement and probably the most valuable thing
+  this session produced.
+
+*Evidence it never worked, checked rather than assumed.* Before deleting, the profile's
+`Local Storage/leveldb` was grepped for `ETMS-Token`: absent. In its entire life the helper
+never once completed the login it existed to perform.
+
+*What was deleted:* `alahly_ticket_prefill.py`, the `browser-profile/` directory, and the
+Tazkarti credential block in `env.example`. The stuck Chromium processes were killed first, so
+the profile could actually be removed rather than silently recreated.
+
+*What was NOT touched:* the local monitor (verified still `Running`, PID 29724, polling every
+~32s with clean scrapes throughout), the CI job, `last_seen.json`, and the shared scrape block.
+The user's own `.env` still contains `TZK_USERNAME`/`TZK_PASSWORD`; nothing reads them now and
+they can be deleted, but that is the user's file to edit.
+
 ---
 
 ## What We Are Building
@@ -910,6 +953,8 @@ Schema section.
 ❌ CAPTCHA solving or bypass                          — never
 ❌ Submitting the login form / clicking "Sign in"     — never (it IS the CAPTCHA)
 ❌ Seat / quantity / add-to-cart automation           — deleted 2026-08-25, see v2 table
+❌ A prefill / auto-login helper of ANY kind          — removed 2026-08-26, do not rebuild
+❌ Tazkarti credentials in .env or anywhere in repo   — nothing needs them now
 ❌ Running the prefill helper in CI                   — never (needs a human at the browser)
 ❌ TZK_USERNAME / TZK_PASSWORD as Actions secrets     — never (public repo, and pointless)
 ❌ Multiple accounts, proxy rotation, IP cycling      — never
@@ -986,7 +1031,7 @@ tazkarti-bot/
 ├── .vscode/                         ✅ editor config
 ├── alahly_ticket_check.py           ✅ CI single-run — SOURCE OF TRUTH for the shared block
 ├── alahly_ticket_monitor.py         ✅ local loop — reference implementation
-├── alahly_ticket_prefill.py         ✅ local helper — login pre-fill ONLY, never submits
+│                                    (alahly_ticket_prefill.py REMOVED 2026-08-26)
 ├── sync_shared_block.py             ✅ copies + verifies the shared block (rule 13)
 ├── install_local_monitor_task.ps1   ✅ registers the always-on Task Scheduler job
 ├── get_telegram_chat_id.py          ✅ one-shot setup helper
@@ -1088,19 +1133,13 @@ TZK_URL=https://www.tazkarti.com/#/matches
 TELEGRAM_BOT_TOKEN=<from @BotFather>
 TELEGRAM_CHAT_ID=<from get_telegram_chat_id.py>
 
-# ── Prefill helper (LOCAL .env ONLY — NEVER in GitHub secrets) ───
-# NOTE: TZK_USERNAME is NOT an email. The login field is "Tazkarti ID *"
-# (input[name="txtFanId"], maxlength 16, placeholder 12345678901234) and wants
-# a 14-16 digit numeric ID. The value currently in .env is a correct 14-digit one.
-# Both are read LAZILY -- only when you are actually logged out. Once the
-# profile holds a session, the helper never touches them.
-TZK_USERNAME=<your 14-16 digit Tazkarti ID>
-TZK_PASSWORD=<your Tazkarti account password>
-TZK_MATCH_URL=<specific match page; defaults to the #/matches listing>
-TZK_PROFILE_DIR=<optional; default %LOCALAPPDATA%\tazkarti-monitor\browser-profile>
-
-# TZK_SEAT_CATEGORY and TZK_QUANTITY are GONE -- the code that read them was
-# deleted with the seat-selection scope. Do not reintroduce them; see the v2 table.
+# ── Tazkarti account credentials: NOT USED ANYWHERE ──────────────
+# There are none. TZK_USERNAME / TZK_PASSWORD / TZK_MATCH_URL /
+# TZK_SEAT_CATEGORY / TZK_QUANTITY / TZK_PROFILE_DIR were all removed with
+# the prefill helper on 2026-08-26. Nothing in this repo needs your Tazkarti
+# login, and that is a feature: the repo is PUBLIC and a .env carrying those
+# credentials was committed to it once. If they are still in your local .env,
+# delete those two lines -- nothing reads them.
 ```
 
 ```bash
@@ -1309,73 +1348,62 @@ The booking modal is `#book-ticket-modal`, containing `.book-second-step` and
 
 ---
 
-### Phase 3 - login pre-fill helper (BUILT 2026-08-25, deliberately reduced scope)
+### Phase 3 — why there is no prefill helper (REMOVED 2026-08-26)
 
-**The scope is: open a visible browser on a persistent profile, and type the two login fields
-in. That is all it does, and that is finished — not a stepping stone to something larger.**
-The human clicks Sign in and solves the CAPTCHA. The script never submits.
+**`alahly_ticket_prefill.py` was deleted. Do not rebuild it. Recover it with
+`git show <pre-removal-sha>:alahly_ticket_prefill.py` if you want to read it, but read this
+section first — the reasons it went are not reasons that expire.**
 
-**Login selectors - read from the live DOM 2026-08-25, each confirmed to resolve to exactly one
-element. NOT guessed.** Re-derive them by dumping `https://www.tazkarti.com/#/login`; note the
-form carries **no `id` attributes**, so select on `name`:
+It was built, rescoped twice, debugged for hours, and **never once completed a login.** The
+final profile directory was checked byte-for-byte before deletion: no `ETMS-Token` anywhere,
+i.e. it never achieved the one thing it existed to do.
 
-```
-https://www.tazkarti.com/#/login
-  form
-    input[name="txtFanId"]      label "Tazkarti ID *", maxlength 16, placeholder 12345678901234
-                                -- a 14-16 digit numeric ID, NOT an email
-    input[name="txtPassword"]   maxlength 20
-    re-captcha#ngrecaptcha-0    invisible reCAPTCHA v2 -- THE BLOCKER, see Standing Blockers
-    button.button-green         text "Sign in", type="button" (NOT a submit; its click handler
-                                is recaptchaRef.execute())
-```
+**Why removing it was right, and would still be right if the bugs were fixed:**
 
-**These are now written into `alahly_ticket_prefill.py`.** `SIGN_IN_BUTTON` is defined there and
-**intentionally never clicked** — it is recorded because it was expensive to find and because it
-is how you confirm you are looking at the real login form. The file says so at the definition, so
-a future session does not "fix" the unused constant by wiring a `.click()` to it.
+1. **It solved a problem that happens on the wrong device.** Queue position is by ARRIVAL TIME,
+   and you act on an alert from your PHONE. A desktop helper cannot make you earlier. The two
+   things that actually matter — a 30s alert and a phone that is already logged in — are both
+   done and neither involves this script.
+2. **Its remaining job was worse than the browser's own.** After the seat/quantity code was cut,
+   it typed two fields. Chrome's password manager does that natively, with no profile lock, no
+   CAPTCHA fight, and no code to maintain.
+3. **It was the only reason the repo wanted Tazkarti credentials.** With it gone, `TZK_USERNAME`
+   and `TZK_PASSWORD` are gone from `env.example` and needed nowhere. This repo is PUBLIC and a
+   `.env` carrying those exact credentials was committed to it once (`b8ccce9`). Fewer copies is
+   a real security improvement, and it is permanent.
 
-**Session persistence — why the persistent profile actually works.** Read out of
-`main.57e770ff8543ee8f6d96.js`, not assumed:
+**Knowledge worth keeping, so deleting the code does not delete what it cost to learn:**
 
-```js
-getToken   = () => localStorage.getItem("ETMS-Token")   // localStorage, NOT sessionStorage
-isLoggedIn = !!getToken()                               // the app's own definition
-clearCache = () => { localStorage.removeItem("ETMS-Token"); ... }   // logout / 401
-```
+- **Login is gated by an invisible reCAPTCHA v2 whose token is a REQUIRED field of the login
+  API.** `_http.post(url+"Login", {Username, Password, recaptchaResponse})`, and the Sign in
+  button is `type="button"` calling `recaptchaRef.execute()`. There is no code path to a session
+  without a Google-issued token. This is why login cannot be automated, and rule 11 forbids the
+  only two ways around it.
+- **Login selectors**, if anything ever needs to recognise the login page: the form has NO `id`
+  attributes — `input[name="txtFanId"]` (Tazkarti ID, 14–16 digits, NOT an email),
+  `input[name="txtPassword"]`, `form button.button-green`.
+- **The session token is `localStorage["ETMS-Token"]`**, with `isLoggedIn = !!getToken()`. It is
+  localStorage, not sessionStorage, so a browser profile does persist a Tazkarti login. That
+  fact is sound; it was the *value* of exploiting it that did not hold up.
+- **TWO BROWSER INSTANCES ON ONE USER-DATA DIR IS A TRAP.** This cost the most time of anything
+  in this project. A second Chromium launched on a profile another instance still holds does not
+  say "profile locked" — it corrupts the cookie/storage state, and the symptom is reCAPTCHA
+  reporting **"Could not connect to the reCAPTCHA service"** while every single reCAPTCHA
+  request still returns HTTP 200 and `window.grecaptcha` is defined. It reads exactly like a
+  network fault and is not one. If any future script uses a persistent browser profile, check
+  for a live process holding it *before* launching, and never trust a `lockfile` — clean exits
+  leave one behind, so its presence proves nothing.
+- **A per-match URL does not exist** — see the roadmap section. Unrelated to the helper, but
+  found in the same investigation.
 
-`ETMS-Token`, `ETMS-RefreshToken`, `ETMS-ExpireToken` and `profileData` are all **localStorage**;
-only the *guest* token is sessionStorage. localStorage lives in the user-data dir, so it survives
-closing the browser — which is the entire premise of the rescope. **Verified empirically, not
-just read:** a token written by one process was read back by a different process after a full
-browser restart.
+**The replacement is: log in with your ordinary browser and let it remember you.** On the phone,
+because that is where a drop alert gets acted on. There is nothing to build.
 
-**Stale-session detection, and its limit.** The site's header requests the cart-icon count on
-every page, and that request is authenticated; if the token is dead the response 401s and
-Tazkarti's own interceptor runs `clearCache()`, deleting `ETMS-Token`. So the script reads the
-token, lets the page settle, and reads it again — a token that vanished in between is a session
-the server just rejected. **Confirmed live** by planting a bogus token and watching the site
-delete it. The limit, which is written into the script's runbook too: every client-side signal
-(token, header, "Welcome <name>") comes from the same localStorage, so if the site makes no
-authenticated call while we look, a dead token can still read as LOGGED IN. The tell is then the
-ordinary one — the header says "Sign in" instead of your name.
-
-**`TZK_MATCH_URL` correctly defaults to the LISTING, and that is permanent, not a placeholder.**
-There is no per-match URL to point it at — see the roadmap section above for the evidence. The
-alert links to the same place for the same reason. Note what this means in practice: tapping the
-Telegram link opens the match **list**, and "Book Ticket" there sends you to `#/login` if that
-browser has no session. The persistent profile does NOT help — it is a Chromium user-data dir on
-the monitoring machine, and a phone is a different device with a different browser. Being signed
-in on the phone is a manual, human, one-time thing.
-
-**`#seat-category`, `#quantity`, `#add-to-cart` are GONE**, along with the code that used them.
-They were fabricated and never matched a real element. Deleted rather than left as TODOs, because
-a TODO reads as unfinished work and invites a future session to finish it. See the v2 table for
-why rebuilding them is low-value.
-
-**The boundary is unchanged and is not an unfinished TODO.** No auto-pay, no "Confirm", no CAPTCHA
-solving. The helper stops at the cart and hands control to the human. Keep the prefill docstring's
-explanation of both boundaries intact - the brief reaffirmed this explicitly.
+**The phone is what matters, and nothing here can do it for you.** Tapping a Telegram alert
+opens the match LIST, and "Book Ticket" there sends you to `#/login` if that browser has no
+session -- verified live. So sign in on the PHONE, in its ordinary browser, and let it remember
+you. A profile on the monitoring machine is a different device and a different browser; it never
+helped with this and no longer exists.
 
 ---
 
@@ -1440,22 +1468,11 @@ Unregister-ScheduledTask -TaskName "Tazkarti Local Monitor" -Confirm:$false
 #   watcher started" message. If it does not arrive, check the log above
 #   and Get-ScheduledTaskInfo -TaskName "Tazkarti Local Monitor".
 
-# ── THE LOGIN PRE-FILL HELPER (Phase 3) ──────────────────────────
-# Opens a VISIBLE browser on a persistent profile and types your login
-# in. You click Sign in and solve the CAPTCHA. It never submits.
-python alahly_ticket_prefill.py
-#   First run  -> "LOGGED OUT",     fills both fields, you sign in.
-#   Later runs -> "LOGGED IN",      goes straight to TZK_MATCH_URL.
-#   Stale one  -> "SESSION EXPIRED", fills both fields again.
-# Press Enter in the terminal to close -- that flush is what saves the
-# session. The file's own RUNBOOK section has the full detail.
-
-# Where the profile lives (holds a LIVE session token -- treat as a
-# credential, and keep it out of the repo and out of OneDrive):
-#   %LOCALAPPDATA%\tazkarti-monitor\browser-profile
-# Full reset, only if signing in repeatedly fails -- it also throws away
-# cookies and the profile's CAPTCHA reputation, so not routine:
-#   Remove-Item -Recurse -Force "$env:LOCALAPPDATA\tazkarti-monitor\browser-profile"
+# ── LOGGING IN TO TAZKARTI ──────────────────────────────
+# There is no script for this, on purpose. Open tazkarti.com in your
+# ordinary browser and sign in; let the browser remember you.
+# Do it on the PHONE -- that is where you act on an alert.
+# See Feature Specs -> "Phase 3 -- why there is no prefill helper".
 
 # ── CHANGING THE SCRAPER (rule 13) ───────────────────────────────
 # Edit ONLY alahly_ticket_check.py, between the SHARED SCRAPE BLOCK
