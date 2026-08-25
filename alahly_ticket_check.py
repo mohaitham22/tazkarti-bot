@@ -123,6 +123,62 @@ def dump_evidence(page, tag: str) -> None:
         print("Could not save debug evidence:", e)
 
 
+# --------------------------------------------------------------------
+# pagination
+# --------------------------------------------------------------------
+# Tazkarti renders only the first page of fixtures and appends the rest
+# behind a "View More" button. A scrape that never clicks it sees page 1
+# and nothing else -- which is how a live "ZED FC vs Al Ahly FC" sat
+# unnoticed on page 2 while the monitor reported 0 Al Ahly fixtures.
+#
+# Re-derive from devtools: the control is
+#     button.button.button-blue.width-auto     text "View More"
+# and it reports disabled once the whole list is loaded. Selecting it by
+# class rather than by text keeps this working if the site is served in
+# Arabic; :not(.filter-toggle) is required because the two Search buttons
+# share button-blue and width-auto.
+LOAD_MORE_SELECTOR = "button.button-blue.width-auto:not(.filter-toggle)"
+LOAD_MORE_MAX_CLICKS = 20    # ~4-6 fixtures per page, so 20 covers a season
+LOAD_MORE_WAIT_MS = 2000     # give Angular time to append the next page
+
+
+def count_match_cards(page) -> int:
+    return page.evaluate("() => document.querySelectorAll('.team-names').length")
+
+
+def load_all_pages(page) -> int:
+    """Click "View More" until the entire fixture list is in the DOM.
+
+    Returns the number of clicks used. Raises ScrapeError if the button is
+    still live afterwards: at that point we cannot prove we have seen the
+    whole listing, and reporting a partial scrape as a complete one is
+    exactly the bug this function exists to fix.
+    """
+    clicks = 0
+    while clicks < LOAD_MORE_MAX_CLICKS:
+        button = page.query_selector(LOAD_MORE_SELECTOR)
+        if button is None or not button.is_enabled():
+            return clicks
+
+        before = count_match_cards(page)
+        button.click()
+        page.wait_for_timeout(LOAD_MORE_WAIT_MS)
+        clicks += 1
+
+        if count_match_cards(page) == before:
+            # Button still present but nothing new arrived. Treat the list
+            # as finished rather than clicking forever.
+            return clicks
+
+    button = page.query_selector(LOAD_MORE_SELECTOR)
+    if button is not None and button.is_enabled():
+        raise ScrapeError(
+            f"'View More' was still active after {LOAD_MORE_MAX_CLICKS} clicks. "
+            "Refusing to report a partial listing as if it were complete."
+        )
+    return clicks
+
+
 def fetch_al_ahly_matches(page) -> list:
     """Return the sorted list of Al Ahly fixtures, or raise ScrapeError."""
     page.goto(TZK_URL, wait_until="domcontentloaded", timeout=45000)
@@ -136,6 +192,14 @@ def fetch_al_ahly_matches(page) -> list:
             "match cards -- likely blocked, geo-restricted, or the markup changed."
         )
 
+    # Load every page BEFORE parsing, or the scrape silently covers only
+    # the first one.
+    try:
+        clicks = load_all_pages(page)
+    except ScrapeError:
+        dump_evidence(page, "load-more")
+        raise
+
     result = page.evaluate(PAGE_SCRIPT)
     total = result["total"]
     al_ahly = result["alAhly"]
@@ -144,7 +208,8 @@ def fetch_al_ahly_matches(page) -> list:
         dump_evidence(page, "zero-cards")
         raise ScrapeError("Selector matched but zero match cards parsed.")
 
-    print(f"Parsed {total} match cards, {len(al_ahly)} of them Al Ahly.")
+    print(f"Parsed {total} match cards after {clicks} 'View More' click(s), "
+          f"{len(al_ahly)} of them Al Ahly.")
     # Sorted so a mere reordering of the listing doesn't look like a change.
     return sorted(al_ahly)
 
