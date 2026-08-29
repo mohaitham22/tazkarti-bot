@@ -1,14 +1,6 @@
 {
-  "hash": "b290f72c80c3de28de0ad54a7c6426fdf60367189ccc5bcd3d1b29bd46afe910",
+  "hash": "a9096a99c7e3bd8ea368c22f2140be938ec8e4656b73082e45db4da00fe149e3",
   "matches": [
-    {
-      "match_id": 2559,
-      "fixture": "ZED FC vs Al Ahly FC",
-      "status": 2,
-      "status_label": "MATCH_ENDED",
-      "status_badge": "Match Ended",
-      "status_class": "red"
-    },
     {
       "match_id": 2568,
       "fixture": "Al Ahly FC vs Smouha SC",
@@ -19,5 +11,5 @@
     }
   ],
   "consecutive_failures": 0,
-  "updated_at": "2026-08-28T17:20:49+00:00"
+  "updated_at": "2026-08-29T01:04:11+00:00"
 }
