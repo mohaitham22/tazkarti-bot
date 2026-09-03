@@ -1,15 +1,15 @@
 {
-  "hash": "a9096a99c7e3bd8ea368c22f2140be938ec8e4656b73082e45db4da00fe149e3",
+  "hash": "09df72c29a6ce06384abfa491fa1eb601212911ed03816f218989dbb76349dfa",
   "matches": [
     {
       "match_id": 2568,
       "fixture": "Al Ahly FC vs Smouha SC",
-      "status": 1,
-      "status_label": "AVAILABLE",
-      "status_badge": "Available",
-      "status_class": "green"
+      "status": 3,
+      "status_label": "BOOKING_CLOSED",
+      "status_badge": "Booking Closed",
+      "status_class": "red"
     }
   ],
   "consecutive_failures": 0,
-  "updated_at": "2026-09-03T11:27:24+00:00"
+  "updated_at": "2026-09-03T15:09:11+00:00"
 }
