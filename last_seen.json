@@ -1,15 +1,15 @@
 {
-  "hash": "6d80927cd0794a1fb14535cc26138468b329ad373a2ec2526760c310a74ab3de",
+  "hash": "ed8f2ed0eb9bf269dbe9daa4ff016aac919c179e5ecba22f8cd116aaada40b3b",
   "matches": [
     {
       "match_id": 2580,
       "fixture": "Arab Contractors Sporting Club vs Al Ahly FC",
-      "status": 1,
-      "status_label": "AVAILABLE",
-      "status_badge": "Available",
-      "status_class": "green"
+      "status": 3,
+      "status_label": "BOOKING_CLOSED",
+      "status_badge": "Booking Closed",
+      "status_class": "red"
     }
   ],
   "consecutive_failures": 0,
-  "updated_at": "2026-09-09T11:14:17+00:00"
+  "updated_at": "2026-09-09T15:10:05+00:00"
 }
