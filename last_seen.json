@@ -1,6 +1,15 @@
 {
-  "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "matches": [],
+  "hash": "707123f928bea1abfd493024d26e00ff1d6aaa7ea9173bd60619b749a8ad1dc0",
+  "matches": [
+    {
+      "match_id": 2588,
+      "fixture": "Al Ahly FC vs Abou Qir Fertilizers",
+      "status": 1,
+      "status_label": "AVAILABLE",
+      "status_badge": "Available",
+      "status_class": "green"
+    }
+  ],
   "consecutive_failures": 0,
-  "updated_at": "2026-09-12T10:23:54+00:00"
+  "updated_at": "2026-09-12T13:41:50+00:00"
 }
